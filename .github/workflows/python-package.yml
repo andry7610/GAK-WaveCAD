@@ -16,15 +16,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: List files
-        run: |
-          echo "=== Root files ==="
-          ls -la
-          echo "=== tests/ folder ==="
-          ls -la tests/ || echo "tests/ folder NOT FOUND"
-          echo "=== .gitignore ==="
-          cat .gitignore || echo "no .gitignore"
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -35,11 +26,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install numpy scipy
 
+      - name: Find test files
+        run: |
+          find . -name "*test*.py" -type f
+
       - name: Run tests
         env:
           PYTHONPATH: .
         run: |
-          python tests/run_acoustic_test.py
-          python tests/run_born_collapse_test.py
-          python tests/run_coupling_test.py
-          python tests/run_magnon_test.py
+          python run_acoustic_test.py
+          python run_born_collapse_test.py
+          python run_coupling_test.py
+          python run_magnon_test.py
