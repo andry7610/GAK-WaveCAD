@@ -11,12 +11,8 @@ run_acoustic_test.py — Точка входа для интеграционно
     python run_acoustic_test.py
 """
 
-import sys
 import os
 import numpy as np
-
-# Добавляем корень репозитория в путь для импорта
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from physical_modules.acoustic_monitor import AcousticMonitor
 
