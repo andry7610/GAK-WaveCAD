@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11"]
+        python-version: ["3.10", "3.11"]
 
     steps:
     - uses: actions/checkout@v4
@@ -25,6 +25,8 @@ jobs:
         python -m pip install --upgrade pip
         python -m pip install numpy scipy
     - name: Run tests
+      env:
+        PYTHONPATH: .
       run: |
         python tests/run_acoustic_test.py
         python tests/run_coupling_test.py
