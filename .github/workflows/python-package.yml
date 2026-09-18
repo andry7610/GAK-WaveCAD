@@ -16,6 +16,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: List files
+        run: |
+          echo "=== Root files ==="
+          ls -la
+          echo "=== tests/ folder ==="
+          ls -la tests/ || echo "tests/ folder NOT FOUND"
+          echo "=== .gitignore ==="
+          cat .gitignore || echo "no .gitignore"
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
