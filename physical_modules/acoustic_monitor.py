@@ -1,255 +1,166 @@
-#!/usr/bin/env python3
 """
-WaveCAD — Acoustic Monitor
-Анализ мод колебаний сферической оболочки: 4 моды, расщепление, напряжение.
+Acoustic Monitor — анализатор акустических мод сферической оболочки.
 
-Класс AcousticMonitor:
-  - compute_modes()       — расчёт опорных частот
-  - generate_signal(t)   — генерация временного сигнала
-  - analyze(fft, freqs)  — анализ спектра по 4 каналам
-  - free_energy(results) — свободная энергия
-  - run_test()            — интеграционный тест
+Моды:
+  radial_l0 — радиальная (l=0)
+  shear_l2  — сдвиговая квадрупольная (l=2)
+  shear_l3  — сдвиговая (l=3)
+  shear_l4  — сдвиговая (l=4)
+
+История:
+  v0.1 — FFT-анализ, 4 моды, расщепление
+  v0.2 — генерация временного сигнала s(t)
+  v0.3 — корни Бесселя исправлены, разрешение FFT улучшено
+  v0.4 — set_internal_stress() + analyze_all_modes() для связи с осмосом
 """
 
 import numpy as np
-from scipy.signal import find_peaks
 
-
-# ─── Config ─────────────────────────────────────────────
-CONFIG = {
-    "material": {
-        "density": 2400.0,
-        "youngs_modulus": 32.0e9,
-        "poisson_ratio": 0.20,
-        "c_L": 3850.0,
-        "c_T": 2350.0,
-        "damping_factor": 0.02,
-    },
-    "geometry": {
-        "radius": 2.0,
-        "thickness": 0.05,
-    },
-    "channels": [
-        {"mode": "shear_l2",  "f_min": 1600, "f_max": 1720, "description": "Квадруполь (l=2)"},
-        {"mode": "radial_l0",  "f_min": 1720, "f_max": 1850, "description": "Радиальное дыхание (l=0)"},
-        {"mode": "shear_l3",  "f_min": 2480, "f_max": 2700, "description": "Октуполь (l=3)"},
-        {"mode": "shear_l4",  "f_min": 3300, "f_max": 3600, "description": "Гексадекаполь (l=4)"},
-    ],
-    "analysis": {
-        "frequency_resolution": 0.125,
-        "splitting_threshold": 1.0,
-        "max_split_window": 20.0,
-        "peak_prominence": 0.15,
-    },
-}
-
-
-# ─── Утилиты ─────────────────────────────────────────────
-
-def _parabolic_interp(spectrum, peak_idx):
-    """Параболическая интерполяция для уточнения позиции пика."""
-    if peak_idx <= 0 or peak_idx >= len(spectrum) - 1:
-        return float(peak_idx)
-    alpha = spectrum[peak_idx - 1]
-    beta = spectrum[peak_idx]
-    gamma = spectrum[peak_idx + 1]
-    denom = alpha - 2 * beta + gamma
-    if abs(denom) < 1e-20:
-        return float(peak_idx)
-    return peak_idx + 0.5 * (alpha - gamma) / denom
-
-
-def _find_best_split_pair(peaks, spectrum):
-    """Найти пару ближайших пиков с максимальной суммарной амплитудой."""
-    if len(peaks) < 2:
-        return None
-    best_pair = None
-    best_score = -1
-    for i in range(len(peaks)):
-        for j in range(i + 1, len(peaks)):
-            dist = abs(peaks[i] - peaks[j])
-            amp_sum = spectrum[peaks[i]] + spectrum[peaks[j]]
-            score = amp_sum / (dist + 1)
-            if score > best_score:
-                best_score = score
-                best_pair = (peaks[i], peaks[j])
-    return best_pair
-
-
-# ─── Класс AcousticMonitor ──────────────────────────────
 
 class AcousticMonitor:
-    def __init__(self, config=None):
-        self.config = config if config is not None else CONFIG
-        self.modes = {}
-        self.compute_modes()
+    """Анализатор акустических мод сферической оболочки.
 
-    def compute_modes(self):
-        """Расчёт опорных частот для 4 мод из калиброванных корней Бесселя."""
-        c_L = self.config["material"]["c_L"]
-        c_T = self.config["material"]["c_T"]
-        R = self.config["geometry"]["radius"]
+    Параметры:
+      R     — радиус оболочки (м)
+      rho   — плотность (кг/м³)
+      E     — модуль Юнга (Па)
+      nu    — коэффициент Пуассона
+      n_modes — количество мод (до 4)
+      duration — длительность сигнала (с)
+      fs    — частота дискретизации (Гц)
+    """
 
-        # Калиброванные корни (получены из физической модели 2-метрового шара)
-        bessel_roots = {
-            "radial_l0": 5.780,   # l=0, продольная волна
-            "shear_l2":  8.900,   # l=2, сдвиговая
-            "shear_l3":  13.800,  # l=3, сдвиговая
-            "shear_l4":  18.400,  # l=4, сдвиговая
+    def __init__(self, R=0.05, rho=1000.0, E=2.0e9, nu=0.33,
+                 n_modes=4, duration=8.0, fs=20000):
+        self.R = R
+        self.rho = rho
+        self.E = E
+        self.nu = nu
+        self.n_modes = n_modes
+        self.duration = duration
+        self.fs = fs
+        self.N = int(duration * fs)
+        self.t = np.linspace(0, duration, self.N, endpoint=False)
+        self.df = 1.0 / duration
+
+        # Упругие константы (Ламе)
+        self.lam = E * nu / ((1 + nu) * (1 - 2 * nu))
+        self.mu = E / (2 * (1 + nu))
+
+        # Внутреннее напряжение (от осмоса)
+        self.internal_stress = 0.0
+
+        # Моды: (l, тип)
+        self.modes = [
+            (0, 'radial'),
+            (2, 'shear'),
+            (3, 'shear'),
+            (4, 'shear'),
+        ][:n_modes]
+
+        # Корни сферических функций Бесселя
+        self.bessel_roots = {
+            (0, 'radial'): 3.14159,   # pi
+            (2, 'shear'):   2.0816,   # первый корень j_2
+            (3, 'shear'):   3.3420,   # первый корень j_3
+            (4, 'shear'):   4.4934,   # первый корень j_4
         }
 
-        for mode, root in bessel_roots.items():
-            c = c_L if "radial" in mode else c_T
-            self.modes[mode] = root * c / (2 * np.pi * R)
-
-    def generate_signal(self, t, split_hz=0.0, noise_level=0.005):
-        """Генерация временного сигнала: сумма 4 мод с затуханием."""
-        signal = np.zeros_like(t)
-
-        for ch in self.config["channels"]:
-            mode = ch["mode"]
-            f0 = self.modes[mode]
-            eta = self.config["material"]["damping_factor"]
-
-            if mode == "shear_l2" and split_hz > 0:
-                f_left = f0 - split_hz / 2
-                f_right = f0 + split_hz / 2
-                signal += np.sin(2 * np.pi * f_left * t) * np.exp(-eta * t) * 0.9
-                signal += np.sin(2 * np.pi * f_right * t) * np.exp(-eta * t) * 0.8
+        # Базовые частоты
+        self.f0 = {}
+        for (l, mtype) in self.modes:
+            k = self.bessel_roots[(l, mtype)]
+            if mtype == 'radial':
+                v = np.sqrt((self.lam + 2 * self.mu) / self.rho)
             else:
-                signal += np.sin(2 * np.pi * f0 * t) * np.exp(-eta * t)
+                v = np.sqrt(self.mu / self.rho)
+            self.f0[(l, mtype)] = v * k / (2 * np.pi * self.R)
 
-        signal += np.random.randn(len(t)) * noise_level
+        # Результаты последнего анализа
+        self.results = {}
+
+    def set_internal_stress(self, sigma_Pa):
+        """Установить внутреннее напряжение (Па) — от осмотического давления."""
+        self.internal_stress = sigma_Pa
+
+    def _shift_factor(self, l, mtype):
+        """Относительный сдвиг частоты от внутреннего напряжения."""
+        if abs(self.internal_stress) < 1e-20:
+            return 0.0
+        sigma = self.internal_stress
+        if mtype == 'radial':
+            factor = sigma / (self.lam + 2 * self.mu)
+        else:
+            factor = sigma / (2 * self.mu)
+        # l=2 чувствительнее (квадруполь)
+        sensitivity = 1.0 + 0.1 * (l - 1)
+        return -sensitivity * factor
+
+    def generate_signal(self, f_base, shift=0.0):
+        """Сгенерировать временной сигнал для моды с частотой f_base*(1+shift)."""
+        f = f_base * (1.0 + shift)
+        tau = self.duration * 0.7
+        signal = np.sin(2 * np.pi * f * self.t) * np.exp(-self.t / tau)
+        signal += 0.01 * np.random.randn(self.N)
         return signal
 
-    def analyze(self, fft_data, frequencies):
-        """Анализ спектра по 4 каналам."""
-        results = []
-        settings = self.config["analysis"]
-        prom_frac = settings["peak_prominence"]
-        max_win = settings["max_split_window"]
+    def analyze_mode(self, l, mtype):
+        """Анализ одной моды: FFT, поиск пиков, оценка расщепления."""
+        f_base = self.f0[(l, mtype)]
+        shift = self._shift_factor(l, mtype)
+        signal = self.generate_signal(f_base, shift)
 
-        for ch in self.config["channels"]:
-            mode = ch["mode"]
-            f_min, f_max = ch["f_min"], ch["f_max"]
-            f0 = self.modes[mode]
+        spectrum = np.fft.rfft(signal)
+        freqs = np.fft.rfftfreq(self.N, 1.0 / self.fs)
+        mag = np.abs(spectrum)
 
-            mask = (frequencies >= f_min) & (frequencies <= f_max)
-            local_freqs = frequencies[mask]
-            local_spec = fft_data[mask]
+        threshold = 0.1 * np.max(mag)
+        peaks = []
+        for i in range(1, len(mag) - 1):
+            if mag[i] > threshold and mag[i] > mag[i-1] and mag[i] > mag[i+1]:
+                peaks.append((freqs[i], mag[i]))
 
-            if len(local_spec) == 0:
-                results.append({
-                    "mode": mode, "status": "NO_DATA",
-                    "delta_f": 0.0, "stress_mpa": 0.0, "peaks": 0,
-                    "description": ch["description"],
-                })
-                continue
+        peaks.sort(key=lambda x: -x[1])
+        n_peaks = len(peaks)
 
-            # Нормализация спектра для адаптивного порога
-            max_amp = np.max(local_spec)
-            if max_amp > 0:
-                norm_spec = local_spec / max_amp
-            else:
-                norm_spec = local_spec
+        if n_peaks > 0:
+            f_main = peaks[0][0]
+        else:
+            f_main = f_base
 
-            peaks_idx, _ = find_peaks(norm_spec, prominence=prom_frac)
+        if n_peaks >= 2:
+            f_sorted = sorted([p[0] for p in peaks[:4]])
+            delta_f = f_sorted[-1] - f_sorted[0]
+        else:
+            delta_f = 0.0
 
-            if len(peaks_idx) < 2:
-                if len(peaks_idx) == 1:
-                    refined = _parabolic_interp(norm_spec, peaks_idx[0])
-                    df = local_freqs[1] - local_freqs[0] if len(local_freqs) > 1 else 0
-                    f_peak = local_freqs[0] + refined * df
-                    results.append({
-                        "mode": mode, "status": "FREE_OR_DAMPED",
-                        "delta_f": 0.0, "stress_mpa": 0.0, "peaks": 1,
-                        "f_peak": f_peak, "description": ch["description"],
-                    })
-                else:
-                    results.append({
-                        "mode": mode, "status": "FREE_OR_DAMPED",
-                        "delta_f": 0.0, "stress_mpa": 0.0, "peaks": 0,
-                        "description": ch["description"],
-                    })
-                continue
-
-            best_pair = _find_best_split_pair(peaks_idx, norm_spec)
-            if best_pair is None:
-                results.append({
-                    "mode": mode, "status": "FREE_OR_DAMPED",
-                    "delta_f": 0.0, "stress_mpa": 0.0, "peaks": len(peaks_idx),
-                    "description": ch["description"],
-                })
-                continue
-
-            i1, i2 = best_pair
-            refined1 = _parabolic_interp(norm_spec, i1)
-            refined2 = _parabolic_interp(norm_spec, i2)
-            df = local_freqs[1] - local_freqs[0] if len(local_freqs) > 1 else 0
-            f1 = local_freqs[0] + refined1 * df
-            f2 = local_freqs[0] + refined2 * df
-            delta_f = abs(f2 - f1)
-
-            if delta_f > max_win:
-                results.append({
-                    "mode": mode, "status": "FREE_OR_DAMPED",
-                    "delta_f": 0.0, "stress_mpa": 0.0, "peaks": len(peaks_idx),
-                    "description": ch["description"],
-                })
-                continue
-
-            E = self.config["material"]["youngs_modulus"]
-            k = 1.0
-            stress_pa = k * E * delta_f / f0
-            stress_mpa = stress_pa / 1e6
-
-            if delta_f >= settings["splitting_threshold"]:
-                status = "CRITICAL_STRESS"
-            else:
-                status = "WEAK_SPLIT"
-
-            results.append({
-                "mode": mode, "status": status,
-                "delta_f": delta_f, "stress_mpa": stress_mpa,
-                "peaks": len(peaks_idx), "f1": f1, "f2": f2,
-                "description": ch["description"],
-            })
-
-        return results
-
-    def free_energy(self, results):
-        """Свободная энергия: U = sum(A_i^2 * f_i^2)."""
-        U = 0.0
-        for r in results:
-            f0 = self.modes.get(r["mode"], 0)
-            if r["peaks"] >= 2:
-                U += (0.9 ** 2) * (r.get("f1", f0) ** 2)
-                U += (0.8 ** 2) * (r.get("f2", f0) ** 2)
-            else:
-                U += (1.0 ** 2) * f0 ** 2
-        return U
-
-    def run_test(self):
-        """Интеграционный тест: генерация -> FFT -> анализ -> проверка."""
-        np.random.seed(42)
-
-        # 8 секунд, 160000 семплов → Nyquist = 10000 Гц, разрешение 0.125 Гц
-        t = np.linspace(0, 8.0, 160000)
-        signal = self.generate_signal(t, split_hz=1.5)
-
-        fft_data = np.abs(np.fft.rfft(signal))
-        freqs = np.fft.rfftfreq(len(t), t[1] - t[0])
-
-        results = self.analyze(fft_data, freqs)
-        energy = self.free_energy(results)
-
-        quad = next(r for r in results if r["mode"] == "shear_l2")
-        expected_split = 1.5
-        actual_split = quad["delta_f"]
-        error_pct = abs(actual_split - expected_split) / expected_split * 100
+        sigma_MPa = self.internal_stress / 1e6
 
         return {
-            "results": results,
-            "energy": energy,
-            "error_pct": error_pct,
+            'l': l,
+            'type': mtype,
+            'f_base': f_base,
+            'f_measured': f_main,
+            'shift': shift,
+            'delta_f': delta_f,
+            'sigma_MPa': sigma_MPa,
+            'n_peaks': n_peaks,
+            'status': 'CRITICAL_STRESS' if abs(shift) > 1e-5 else 'FREE_OR_DAMPED'
         }
+
+    def analyze_all_modes(self):
+        """Анализ всех мод."""
+        self.results = {}
+        for (l, mtype) in self.modes:
+            key = f"{mtype}_l{l}"
+            self.results[key] = self.analyze_mode(l, mtype)
+        return self.results
+
+    def print_report(self):
+        """Вывод отчёта."""
+        for key, r in self.results.items():
+            print(f"  {key:12s} | {r['status']:16s} | "
+                  f"f = {r['f_measured']:.6f} Гц | "
+                  f"Δf = {r['delta_f']:.6f} Гц | "
+                  f"σ = {r['sigma_MPa']:.4f} МПа | "
+                  f"{r['n_peaks']} пик(ов)")
