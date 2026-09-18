@@ -37,4 +37,4 @@ jobs:
           python run_acoustic_test.py
           python run_born_collapse_test.py
           python run_coupling_test.py
-          python run_magnon_test.py
+          python run_magnon_test.py-
