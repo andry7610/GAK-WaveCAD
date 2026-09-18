@@ -10,9 +10,6 @@ WaveCAD — Acoustic Monitor Integration Test
 import os
 import numpy as np
 
-from physical_modules.acoustic_monitor import AcousticMonitor
-
-
 def main():
     print("=" * 64)
     print("  WaveCAD — Acoustic Monitor Integration Test")
