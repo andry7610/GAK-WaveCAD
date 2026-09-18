@@ -16,10 +16,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
+    - name: Set up Python \${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: \${{ matrix.python-version }}
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
@@ -29,7 +29,6 @@ jobs:
         PYTHONPATH: .
       run: |
         python tests/run_acoustic_test.py
+        python tests/run_born_collapse_test.py
         python tests/run_coupling_test.py
         python tests/run_magnon_test.py
-        python tests/run_born_collapse_test.py
-
