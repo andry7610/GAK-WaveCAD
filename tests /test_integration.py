@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GAK-WaveCAD — Integration Test
-Связка: осмос → термалка → акустика.
+Связка: осмос → термалка → акустика → коллапс.
 """
 
 import os
@@ -13,13 +13,14 @@ from core.logger import get_logger
 from physical_modules.osmosis_monitor import OsmosisMonitor
 from physical_modules.thermal_monitor import ThermalMonitor
 from physical_modules.acoustic_monitor import AcousticMonitor
+from physical_modules.born_collapse_monitor import BornCollapseMonitor
 
 
 def main():
     logger = get_logger("integration_test")
 
     print("=" * 64)
-    print("  GAK-WaveCAD — Integration Test (осмос → термалка → акустика)")
+    print("  GAK-WaveCAD — Integration Test (осмос → термалка → акустика → коллапс)")
     print("=" * 64)
 
     # Осмос
@@ -27,8 +28,9 @@ def main():
     osmosis.init()
     osmosis.run()
     stress_osm = osmosis.get_stress_Pa()
+    osm_pressure = osmosis.results['pi_Pa']
 
-    logger.info(f"Осмос: stress={stress_osm:.1f} Па")
+    logger.info(f"Осмос: stress={stress_osm:.1f} Па, Pi={osm_pressure:.1f} Па")
     osmosis.print_report()
 
     # Термалка
@@ -56,11 +58,20 @@ def main():
               f"f_meas={r['f_measured']:.1f} Гц, "
               f"dF={r['delta_f']:+.1f} Гц, {r['status']}")
 
+    # Коллапс
+    collapse = BornCollapseMonitor()
+    collapse.set_external_pressure(osm_pressure)
+    collapse.init()
+    collapse.run()
+    collapse.print_report()
+
     print("\n  Проверки:")
     assert len(results) == 4, "Должно быть 4 моды"
     assert all(r['f_measured'] > 0 for r in results.values()), "Частоты должны быть положительными"
     assert stress_th > 0, "Тепловое напряжение должно быть положительным"
-    logger.info("Интеграционный тест пройден: осмос → термалка → акустика")
+    assert collapse.results['P_cr'] > 0, "Критическое давление должно быть положительным"
+    assert collapse.results['phase'] in ("STABLE", "WARNING", "COLLAPSE", "INFLATION"), "Фаза должна быть определена"
+    logger.info("Интеграционный тест пройден: осмос → термалка → акустика → коллапс")
     print("    ✅ Все проверки пройдены")
 
     print("=" * 64)
