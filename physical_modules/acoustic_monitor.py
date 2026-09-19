@@ -12,12 +12,16 @@ Acoustic Monitor — анализатор акустических мод сфе
   v0.2 — генерация временного сигнала s(t)
   v0.3 — корни Бесселя исправлены, разрешение FFT улучшено
   v0.4 — set_internal_stress() + analyze_all_modes() для связи с осмосом
+  v0.5 — наследование от BaseModule, регистрация в ModuleRegistry
 """
 
 import numpy as np
+from core.base_module import BaseModule
+from core.module_registry import ModuleRegistry
 
 
-class AcousticMonitor:
+@ModuleRegistry.register("acoustic_monitor")
+class AcousticMonitor(BaseModule):
     """Анализатор акустических мод сферической оболочки.
 
     Параметры:
@@ -30,22 +34,26 @@ class AcousticMonitor:
       fs    — частота дискретизации (Гц)
     """
 
-    def __init__(self, R=0.05, rho=1000.0, E=2.0e9, nu=0.33,
-                 n_modes=4, duration=8.0, fs=20000):
-        self.R = R
-        self.rho = rho
-        self.E = E
-        self.nu = nu
-        self.n_modes = n_modes
-        self.duration = duration
-        self.fs = fs
-        self.N = int(duration * fs)
-        self.t = np.linspace(0, duration, self.N, endpoint=False)
-        self.df = 1.0 / duration
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config)
+
+        # Параметры из конфига, с откатом на значения по умолчанию
+        cfg = config or {}
+        self.R = cfg.get("R", kwargs.get("R", 0.05))
+        self.rho = cfg.get("rho", kwargs.get("rho", 1000.0))
+        self.E = cfg.get("E", kwargs.get("E", 2.0e9))
+        self.nu = cfg.get("nu", kwargs.get("nu", 0.33))
+        self.n_modes = cfg.get("n_modes", kwargs.get("n_modes", 4))
+        self.duration = cfg.get("duration", kwargs.get("duration", 8.0))
+        self.fs = cfg.get("fs", kwargs.get("fs", 20000))
+
+        self.N = int(self.duration * self.fs)
+        self.t = np.linspace(0, self.duration, self.N, endpoint=False)
+        self.df = 1.0 / self.duration
 
         # Упругие константы (Ламе)
-        self.lam = E * nu / ((1 + nu) * (1 - 2 * nu))
-        self.mu = E / (2 * (1 + nu))
+        self.lam = self.E * self.nu / ((1 + self.nu) * (1 - 2 * self.nu))
+        self.mu = self.E / (2 * (1 + self.nu))
 
         # Внутреннее напряжение (от осмоса)
         self.internal_stress = 0.0
@@ -56,7 +64,7 @@ class AcousticMonitor:
             (2, 'shear'),
             (3, 'shear'),
             (4, 'shear'),
-        ][:n_modes]
+        ][:self.n_modes]
 
         # Корни сферических функций Бесселя
         self.bessel_roots = {
@@ -79,6 +87,34 @@ class AcousticMonitor:
         # Результаты последнего анализа
         self.results = {}
 
+    # --- Реализация интерфейса BaseModule ---
+
+    def init(self) -> bool:
+        """Проверка целостности параметров перед запуском."""
+        if self.R <= 0:
+            raise ValueError("R must be positive")
+        if self.rho <= 0:
+            raise ValueError("rho must be positive")
+        if self.E <= 0:
+            raise ValueError("E must be positive")
+        if self.n_modes < 1 or self.n_modes > 4:
+            raise ValueError("n_modes must be between 1 and 4")
+        self._set_initialized(True)
+        return True
+
+    def run(self) -> bool:
+        """Основной расчёт — анализ всех мод."""
+        if not self.is_initialized():
+            raise RuntimeError("Module not initialized. Call init() first.")
+        self.analyze_all_modes()
+        return True
+
+    def get_results(self) -> dict:
+        """Возвращает словарь с результатами анализа."""
+        return self.results
+
+    # --- Существующая физика (без изменений) ---
+
     def set_internal_stress(self, sigma_Pa):
         """Установить внутреннее напряжение (Па) — от осмотического давления."""
         self.internal_stress = sigma_Pa
@@ -92,7 +128,6 @@ class AcousticMonitor:
             factor = sigma / (self.lam + 2 * self.mu)
         else:
             factor = sigma / (2 * self.mu)
-        # l=2 чувствительнее (квадруполь)
         sensitivity = 1.0 + 0.1 * (l - 1)
         return -sensitivity * factor
 
