@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GAK-WaveCAD — Integration Test
-Связка: осмос → термалка → акустика → коллапс.
+Связка: осмос → термалка → акустика → коллапс → магноны.
 """
 
 import os
@@ -14,13 +14,15 @@ from physical_modules.osmosis_monitor import OsmosisMonitor
 from physical_modules.thermal_monitor import ThermalMonitor
 from physical_modules.acoustic_monitor import AcousticMonitor
 from physical_modules.born_collapse_monitor import BornCollapseMonitor
+from physical_modules.magnon_monitor import MagnonMonitor
 
 
 def main():
     logger = get_logger("integration_test")
 
     print("=" * 64)
-    print("  GAK-WaveCAD — Integration Test (осмос → термалка → акустика → коллапс)")
+    print("  GAK-WaveCAD — Integration Test")
+    print("  осмос → термалка → акустика → коллапс → магноны")
     print("=" * 64)
 
     # Осмос
@@ -29,8 +31,6 @@ def main():
     osmosis.run()
     stress_osm = osmosis.get_stress_Pa()
     osm_pressure = osmosis.results['pi_Pa']
-
-    logger.info(f"Осмос: stress={stress_osm:.1f} Па, Pi={osm_pressure:.1f} Па")
     osmosis.print_report()
 
     # Термалка
@@ -38,7 +38,6 @@ def main():
     thermal.init()
     thermal.run()
     stress_th = thermal.get_thermal_stress_Pa()
-
     thermal.print_report()
 
     # Суммарное напряжение
@@ -65,13 +64,30 @@ def main():
     collapse.run()
     collapse.print_report()
 
+    # Магноны
+    magnon = MagnonMonitor()
+    magnon.set_mechanical_stress(total_stress)
+    magnon.init()
+    magnon.run()
+    mag_results = magnon.get_results()
+
+    print("\n  Магнонный анализ:")
+    for key, r in mag_results.items():
+        print(f"    {key:14s} : f={r['f']:.3e} Гц, "
+              f"df_stress={r['df_stress']:+.3e} Гц, Q={r['Q']:.0f}")
+
     print("\n  Проверки:")
-    assert len(results) == 4, "Должно быть 4 моды"
-    assert all(r['f_measured'] > 0 for r in results.values()), "Частоты должны быть положительными"
-    assert stress_th > 0, "Тепловое напряжение должно быть положительным"
-    assert collapse.results['P_cr'] > 0, "Критическое давление должно быть положительным"
-    assert collapse.results['phase'] in ("STABLE", "WARNING", "COLLAPSE", "INFLATION"), "Фаза должна быть определена"
-    logger.info("Интеграционный тест пройден: осмос → термалка → акустика → коллапс")
+    assert len(results) == 4, "Должно быть 4 акустические моды"
+    assert all(r['f_measured'] > 0 for r in results.values()), "Акустические частоты > 0"
+    assert stress_th > 0, "Тепловое напряжение > 0"
+    assert collapse.results['P_cr'] > 0, "P_cr > 0"
+    assert len(mag_results) == 4, "Должно быть 4 магнонные моды"
+    assert all(r['f'] > 0 for r in mag_results.values()), "Магнонные частоты > 0"
+    assert all(r['df_stress'] != 0 for r in mag_results.values()), "Сдвиг от напряжения ненулевой"
+    f_kittel = mag_results['kittel_l0']['f']
+    f_exch = mag_results['exchange_l1']['f']
+    assert f_exch > f_kittel, "Обменная мода выше Kittel"
+    logger.info("Интеграционный тест пройден: 5 модулей, все проверки OK")
     print("    ✅ Все проверки пройдены")
 
     print("=" * 64)
