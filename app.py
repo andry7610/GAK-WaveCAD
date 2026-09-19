@@ -103,7 +103,7 @@ collapse.run()
 coll_results = collapse.get_results()
 
 # --- Магноны ---
-mag_cfg = {'R': R, 'h': h, 'B0': B0, 'lambda_s': lambda_s}
+mag_cfg = {'R': R, 'h': h, 'B0': B0, 'lambda_s': lambda_s, 'alpha_bar': alpha_bar}
 magnon = MagnonMonitor(mag_cfg)
 magnon.set_mechanical_stress(total_stress)
 magnon.init()
