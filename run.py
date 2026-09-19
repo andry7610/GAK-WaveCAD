@@ -2,7 +2,7 @@
 GAK-WaveCAD — главная точка запуска.
 
 Загружает конфигурацию, инициализирует модули,
-запускает цепочку: осмос → термалка → акустика → коллапс.
+запускает цепочку: осмос → термалка → акустика → коллапс → магноны.
 """
 
 import os
@@ -16,6 +16,7 @@ from physical_modules.osmosis_monitor import OsmosisMonitor
 from physical_modules.thermal_monitor import ThermalMonitor
 from physical_modules.acoustic_monitor import AcousticMonitor
 from physical_modules.born_collapse_monitor import BornCollapseMonitor
+from physical_modules.magnon_monitor import MagnonMonitor
 
 
 def main():
@@ -39,11 +40,11 @@ def main():
     thermal.run()
     thermal.print_report()
 
-    # Суммарное напряжение для акустики
+    # Суммарное напряжение
     osm_stress = osmosis.get_stress_Pa()
     th_stress = thermal.get_thermal_stress_Pa()
     total_stress = osm_stress + th_stress
-    logger.info(f"Суммарное напряжение: osm={osm_stress:.1f} Па + th={th_stress:.1f} Па = {total_stress:.1f} Па")
+    logger.info(f"Суммарное напряжение: {total_stress:.1f} Па")
 
     # Модуль 3: акустика
     ac_cfg = config.get("acoustic_monitor", {})
@@ -68,7 +69,15 @@ def main():
     collapse.run()
     collapse.print_report()
 
-    logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс")
+    # Модуль 5: магноны
+    mag_cfg = config.get("magnon_monitor", {})
+    magnon = MagnonMonitor(mag_cfg)
+    magnon.set_mechanical_stress(total_stress)
+    magnon.init()
+    magnon.run()
+    magnon.print_report()
+
+    logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс → магноны")
 
 
 if __name__ == "__main__":
