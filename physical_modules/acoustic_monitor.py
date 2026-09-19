@@ -86,24 +86,20 @@ class AcousticMonitor(BaseModule):
             key = f"{mtype}_l{l}"
             f_ref = self.f0[(l, mtype)]
 
-            # Сдвиг частоты под напряжением
             stress_ratio = self.internal_stress / self.E
             f_shifted = f_ref * np.sqrt(1 + stress_ratio)
 
-            # Генерация синтетического сигнала
             t = np.linspace(0, self.duration, int(self.fs * self.duration))
             signal = 0.1 * np.sin(2 * np.pi * f_shifted * t)
             noise = 0.01 * np.random.randn(len(t))
             signal += noise
 
-            # FFT-анализ
             spectrum = np.abs(np.fft.rfft(signal))
             freqs = np.fft.rfftfreq(len(signal), 1 / self.fs)
 
             peak_idx = np.argmax(spectrum)
             f_measured = freqs[peak_idx]
 
-            # Подсчёт пиков
             threshold = 0.1 * np.max(spectrum)
             n_peaks = np.sum(spectrum > threshold)
 
@@ -134,4 +130,4 @@ class AcousticMonitor(BaseModule):
 
     def set_internal_stress(self, stress_Pa: float):
         self.internal_stress = stress_Pa
-        self.logger.info(f"Установлено напряжение: {stress_Pa:.1f} Па")-
+        self.logger.info(f"Установлено напряжение: {stress_Pa:.1f} Па")
