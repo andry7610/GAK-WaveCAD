@@ -6,40 +6,42 @@
 
     GAK-WaveCAD/
     ├── core/
-    │   ├── base_module.py       # Базовый класс модуля
-    │   ├── config_loader.py     # Загрузка YAML-конфигурации
-    │   ├── module_registry.py   # Реестр модулей (декоратор @register)
-    │   └── logger.py            # Логирование
+    │   ├── base_module.py           # Базовый класс модуля
+    │   ├── config_loader.py         # Загрузка YAML-конфигурации
+    │   ├── module_registry.py       # Реестр модулей (декоратор @register)
+    │   └── logger.py                # Логирование
     ├── physical_modules/
     │   ├── osmosis_monitor.py       # Осмотическое давление
     │   ├── thermal_monitor.py       # Тепловые напряжения
     │   ├── acoustic_monitor.py      # Акустические моды
-    │   └── born_collapse_monitor.py # Устойчивость оболочки
+    │   ├── born_collapse_monitor.py # Устойчивость оболочки
+    │   └── magnon_monitor.py        # Спиновые моды (YIG)
     ├── configs/
-    │   └── config.yaml          # Конфигурация всех модулей
+    │   └── config.yaml              # Конфигурация всех модулей
     ├── tests/
     │   ├── run_osmosis_test.py
     │   ├── run_thermal_test.py
     │   ├── run_acoustic_test.py
     │   ├── run_born_collapse_test.py
+    │   ├── run_magnon_test.py
     │   └── test_integration.py
-    ├── run.py                   # Главная точка запуска
-    ├── run_osmosis_test.py      # Корневые копии тестов для CI
+    ├── run.py                       # Главная точка запуска
+    ├── run_osmosis_test.py          # Корневые копии тестов для CI
     ├── run_thermal_test.py
     ├── run_acoustic_test.py
-    └── run_born_collapse_test.py
-
+    ├── run_born_collapse_test.py
+    └── run_magnon_test.py
 
 text
 
-## Цепочка модулей
-
-    Осмос → Термалка → Акустика → Коллапс
-      │         │          │          │
+    Осмос → Термалка → Акустика → Коллапс → Магноны
+      │         │          │          │          │
+      │         │          │          │          └─ Kittel + обменные моды, сдвиг через λ_s
       │         │          │          └─ фаза: STABLE / WARNING / COLLAPSE / INFLATION
       │         │          └─ сдвиг резонансных частот от суммарного напряжения
       │         └─ тепловое напряжение σ_thermal
       └─ осмотическое напряжение σ_osmotic
+
 
 text
 
