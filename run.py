@@ -2,7 +2,7 @@
 GAK-WaveCAD — главная точка запуска.
 
 Загружает конфигурацию, инициализирует модули,
-запускает цепочку: осмос → термалка → акустика → коллапс → магноны.
+запускает цепочку: осмос → термалка → акустика → коллапс → магноны → EM-резонанс.
 """
 
 import os
@@ -17,6 +17,7 @@ from physical_modules.thermal_monitor import ThermalMonitor
 from physical_modules.acoustic_monitor import AcousticMonitor
 from physical_modules.born_collapse_monitor import BornCollapseMonitor
 from physical_modules.magnon_monitor import MagnonMonitor
+from physical_modules.em_resonance_monitor import EMResonanceMonitor
 
 
 def main():
@@ -77,9 +78,18 @@ def main():
     magnon.run()
     magnon.print_report()
 
-    logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс → магноны")
+    # Модуль 6: EM-резонанс
+    em_cfg = config.get("em_resonance_monitor", {})
+    em = EMResonanceMonitor(em_cfg)
+    em.set_mechanical_stress(total_stress)
+    em.init()
+    em.run()
+    em.print_report()
+
+    logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс → магноны → EM-резонанс")
 
 
 if __name__ == "__main__":
     main()
+
 
