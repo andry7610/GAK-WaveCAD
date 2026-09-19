@@ -1,38 +1,55 @@
 """
-GAK-WaveCAD — точка входа.
+GAK-WaveCAD — главная точка запуска.
 
-Загружает конфиг, инициализирует модули через реестр и запускает их.
+Загружает конфигурацию, инициализирует модули,
+запускает цепочку: осмос → акустика.
 """
 
-from core.config_loader import ConfigLoader
-from core.module_registry import ModuleRegistry
+import os
+import sys
 
-# Импортируем модуль, чтобы сработал декоратор @ModuleRegistry.register
+sys.path.insert(0, os.path.dirname(__file__))
+
+from core.config_loader import ConfigLoader
+from core.logger import get_logger
+from physical_modules.osmosis_monitor import OsmosisMonitor
 from physical_modules.acoustic_monitor import AcousticMonitor
 
 
 def main():
-    # Загружаем конфиг
-    config = ConfigLoader.load("configs/config.yaml")
-    print("Конфиг загружен.")
-    print(f"Доступные модули: {ModuleRegistry.list_available()}")
+    logger = get_logger("run")
 
-    # Создаём и инициализируем модуль
-    module = ModuleRegistry.create_and_init("acoustic_monitor", config)
-    print("Модуль acoustic_monitor инициализирован.")
+    # Загрузка конфигурации
+    config_path = os.path.join(os.path.dirname(__file__), "configs", "config.yaml")
+    config = ConfigLoader.load(config_path)
+    logger.info("Конфигурация загружена")
 
-    # Запускаем
-    if module.run():
-        print("Анализ завершён.\n")
-        results = module.get_results()
-        for key, r in results.items():
-            print(f"  {key:12s} | {r['status']:16s} | "
-                  f"f = {r['f_measured']:.6f} Гц | "
-                  f"Δf = {r['delta_f']:.6f} Гц | "
-                  f"σ = {r['sigma_MPa']:.4f} МПа | "
-                  f"{r['n_peaks']} пик(ов)")
-    else:
-        print("Ошибка при выполнении модуля.")
+    # Модуль 1: осмос
+    osm_cfg = config.get("osmosis_monitor", {})
+    osmosis = OsmosisMonitor(osm_cfg)
+    osmosis.init()
+    osmosis.run()
+    osmosis.print_report()
+
+    # Передача напряжения в акустику
+    stress = osmosis.get_stress_Pa()
+    logger.info(f"Передача напряжения в акустику: {stress:.1f} Па")
+
+    # Модуль 2: акустика
+    ac_cfg = config.get("acoustic_monitor", {})
+    acoustic = AcousticMonitor(ac_cfg)
+    acoustic.set_internal_stress(stress)
+    acoustic.init()
+    acoustic.run()
+
+    results = acoustic.get_results()
+    print("\n  Акустический анализ:")
+    for key, r in results.items():
+        print(f"    {key:12s} : f_ref={r['f_reference']:.1f} Гц, "
+              f"f_meas={r['f_measured']:.1f} Гц, "
+              f"Δf={r['delta_f']:+.1f} Гц, {r['status']}")
+
+    logger.info("Цепочка выполнена: осмос → акустика")
 
 
 if __name__ == "__main__":
