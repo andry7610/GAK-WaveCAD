@@ -2,7 +2,8 @@
 GAK-WaveCAD — главная точка запуска.
 
 Загружает конфигурацию, инициализирует модули,
-запускает цепочку: осмос → термалка → акустика → коллапс → магноны → EM-резонанс.
+запускает цепочку:
+  осмос → термалка → акустика → коллапс → магноны → EM → кросс-связи.
 """
 
 import os
@@ -18,6 +19,7 @@ from physical_modules.acoustic_monitor import AcousticMonitor
 from physical_modules.born_collapse_monitor import BornCollapseMonitor
 from physical_modules.magnon_monitor import MagnonMonitor
 from physical_modules.em_resonance_monitor import EMResonanceMonitor
+from physical_modules.coupling_monitor import CouplingMonitor
 
 
 def main():
@@ -54,9 +56,9 @@ def main():
     acoustic.init()
     acoustic.run()
 
-    results = acoustic.get_results()
+    ac_results = acoustic.get_results()
     print("\n  Акустический анализ:")
-    for key, r in results.items():
+    for key, r in ac_results.items():
         print(f"    {key:12s} : f_ref={r['f_reference']:.1f} Гц, "
               f"f_meas={r['f_measured']:.1f} Гц, "
               f"dF={r['delta_f']:+.1f} Гц, {r['status']}")
@@ -86,10 +88,24 @@ def main():
     em.run()
     em.print_report()
 
-    logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс → магноны → EM-резонанс")
+    # Модуль 7: кросс-связи
+    coupling = CouplingMonitor()
+    coupling.init()
+    coupling.set_results(
+        osmosis=osmosis.get_results(),
+        thermal=thermal.get_results(),
+        acoustic=acoustic.get_results(),
+        collapse=collapse.get_results(),
+        magnon=magnon.get_results(),
+        em=em.get_results(),
+    )
+    coupling.run()
+    coupling.print_report()
+
+    logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс → "
+                "магноны → EM → кросс-связи")
 
 
 if __name__ == "__main__":
     main()
-
 
