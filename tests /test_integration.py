@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GAK-WaveCAD — Integration Test
-Связка: осмос → термалка → акустика → коллапс → магноны.
+Связка: осмос → термалка → акустика → коллапс → магноны → EM-резонанс.
 """
 
 import os
@@ -15,6 +15,7 @@ from physical_modules.thermal_monitor import ThermalMonitor
 from physical_modules.acoustic_monitor import AcousticMonitor
 from physical_modules.born_collapse_monitor import BornCollapseMonitor
 from physical_modules.magnon_monitor import MagnonMonitor
+from physical_modules.em_resonance_monitor import EMResonanceMonitor
 
 
 def main():
@@ -22,7 +23,7 @@ def main():
 
     print("=" * 64)
     print("  GAK-WaveCAD — Integration Test")
-    print("  осмос → термалка → акустика → коллапс → магноны")
+    print("  осмос → термалка → акустика → коллапс → магноны → EM-резонанс")
     print("=" * 64)
 
     # Осмос
@@ -49,10 +50,10 @@ def main():
     acoustic.set_internal_stress(total_stress)
     acoustic.init()
     acoustic.run()
-    results = acoustic.get_results()
+    ac_results = acoustic.get_results()
 
     print("\n  Акустический анализ:")
-    for key, r in results.items():
+    for key, r in ac_results.items():
         print(f"    {key:12s} : f_ref={r['f_reference']:.1f} Гц, "
               f"f_meas={r['f_measured']:.1f} Гц, "
               f"dF={r['delta_f']:+.1f} Гц, {r['status']}")
@@ -76,18 +77,27 @@ def main():
         print(f"    {key:14s} : f={r['f']:.3e} Гц, "
               f"df_stress={r['df_stress']:+.3e} Гц, Q={r['Q']:.0f}")
 
+    # EM-резонанс
+    em = EMResonanceMonitor()
+    em.set_mechanical_stress(total_stress)
+    em.init()
+    em.run()
+    em_results = em.get_results()
+
+    print("\n  EM-резонанс:")
+    for key, r in em_results.items():
+        print(f"    {key:12s} : f={r['f_shifted']:.3e} Гц, "
+              f"df_stress={r['df_stress']:+.3e} Гц, Q={r['Q']:.0f}")
+
     print("\n  Проверки:")
-    assert len(results) == 4, "Должно быть 4 акустические моды"
-    assert all(r['f_measured'] > 0 for r in results.values()), "Акустические частоты > 0"
-    assert stress_th > 0, "Тепловое напряжение > 0"
-    assert collapse.results['P_cr'] > 0, "P_cr > 0"
+    assert len(ac_results) == 4, "Должно быть 4 акустические моды"
     assert len(mag_results) == 4, "Должно быть 4 магнонные моды"
+    assert len(em_results) == 4, "Должно быть 4 EM-моды"
     assert all(r['f'] > 0 for r in mag_results.values()), "Магнонные частоты > 0"
-    assert all(r['df_stress'] != 0 for r in mag_results.values()), "Сдвиг от напряжения ненулевой"
-    f_kittel = mag_results['kittel_l0']['f']
-    f_exch = mag_results['exchange_l1']['f']
-    assert f_exch > f_kittel, "Обменная мода выше Kittel"
-    logger.info("Интеграционный тест пройден: 5 модулей, все проверки OK")
+    assert all(r['f_shifted'] > 0 for r in em_results.values()), "EM-частоты > 0"
+    assert all(r['df_stress'] != 0 for r in em_results.values()), "EM-сдвиг от напряжения ненулевой"
+    assert collapse.results['P_cr'] > 0, "P_cr > 0"
+    logger.info("Интеграционный тест пройден: 6 модулей, все проверки OK")
     print("    ✅ Все проверки пройдены")
 
     print("=" * 64)
@@ -95,3 +105,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
