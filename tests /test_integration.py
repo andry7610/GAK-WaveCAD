@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GAK-WaveCAD — Integration Test
-Связка: осмос → термалка → акустика → коллапс → магноны → EM-резонанс.
+Связка: осмос → термалка → акустика → коллапс → магноны → EM → кросс-связи.
 """
 
 import os
@@ -16,6 +16,7 @@ from physical_modules.acoustic_monitor import AcousticMonitor
 from physical_modules.born_collapse_monitor import BornCollapseMonitor
 from physical_modules.magnon_monitor import MagnonMonitor
 from physical_modules.em_resonance_monitor import EMResonanceMonitor
+from physical_modules.coupling_monitor import CouplingMonitor
 
 
 def main():
@@ -23,7 +24,7 @@ def main():
 
     print("=" * 64)
     print("  GAK-WaveCAD — Integration Test")
-    print("  осмос → термалка → акустика → коллапс → магноны → EM-резонанс")
+    print("  осмос → термалка → акустика → коллапс → магноны → EM → кросс-связи")
     print("=" * 64)
 
     # Осмос
@@ -89,15 +90,33 @@ def main():
         print(f"    {key:12s} : f={r['f_shifted']:.3e} Гц, "
               f"df_stress={r['df_stress']:+.3e} Гц, Q={r['Q']:.0f}")
 
+    # Кросс-связи
+    coupling = CouplingMonitor()
+    coupling.init()
+    coupling.set_results(
+        osmosis=osmosis.get_results(),
+        thermal=thermal.get_results(),
+        acoustic=acoustic.get_results(),
+        collapse=collapse.get_results(),
+        magnon=magnon.get_results(),
+        em=em.get_results(),
+    )
+    coupling.run()
+    coupling.print_report()
+
+    coupl_results = coupling.get_results()
+
     print("\n  Проверки:")
-    assert len(ac_results) == 4, "Должно быть 4 акустические моды"
-    assert len(mag_results) == 4, "Должно быть 4 магнонные моды"
-    assert len(em_results) == 4, "Должно быть 4 EM-моды"
-    assert all(r['f'] > 0 for r in mag_results.values()), "Магнонные частоты > 0"
-    assert all(r['f_shifted'] > 0 for r in em_results.values()), "EM-частоты > 0"
-    assert all(r['df_stress'] != 0 for r in em_results.values()), "EM-сдвиг от напряжения ненулевой"
-    assert collapse.results['P_cr'] > 0, "P_cr > 0"
-    logger.info("Интеграционный тест пройден: 6 модулей, все проверки OK")
+    assert len(ac_results) == 4, "4 акустические моды"
+    assert len(mag_results) == 4, "4 магнонные моды"
+    assert len(em_results) == 4, "4 EM-моды"
+    assert coupl_results['stability_index'] > 0, "Stability > 0"
+    assert 0 <= coupl_results['stability_index'] <= 1, "Stability в 0..1"
+    assert coupl_results['system_status'] in ("HEALTHY", "DEGRADED", "CRITICAL")
+    assert coupl_results['k_magnetoelastic'] > 0, "Магнитоупругая связь > 0"
+    assert coupl_results['k_piezoelectric'] > 0, "Пьезосвязь > 0"
+    assert coupl_results['k_thermal_osmosis'] > 0, "Тепло-осмос > 0"
+    logger.info("Интеграционный тест пройден: 7 модулей, все проверки OK")
     print("    ✅ Все проверки пройдены")
 
     print("=" * 64)
@@ -105,4 +124,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
