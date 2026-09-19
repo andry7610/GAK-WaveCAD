@@ -96,7 +96,7 @@ class MagnonMonitor(BaseModule):
                 f = f_base
 
             # Затухание Гилберта: ширина линии
-                        delta_f = self.alpha_damp * 2 * f  # полная ширина (приближённо)
+                                   delta_f = self.alpha_damp * 2 * f  # полная ширина (приближённо)
 
             # Добротность
             Q = f / delta_f if delta_f > 0 else float('inf')
