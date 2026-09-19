@@ -13,10 +13,12 @@ Osmosis Monitor — расчёт осмотического давления в 
 История:
   v0.1 — базовый расчёт по Вант-Гоффу
   v0.2 — наследование от BaseModule, регистрация
+  v0.3 — логирование
 """
 
 from core.base_module import BaseModule
 from core.module_registry import ModuleRegistry
+from core.logger import get_logger
 
 
 @ModuleRegistry.register("osmosis_monitor")
@@ -41,10 +43,8 @@ class OsmosisMonitor(BaseModule):
         self.R_shell = cfg.get("R_shell", kwargs.get("R_shell", 0.05))
         self.h_wall = cfg.get("h_wall", kwargs.get("h_wall", 0.002))
 
-        # Результаты
+        self.logger = get_logger("osmosis_monitor")
         self.results = {}
-
-    # --- Реализация интерфейса BaseModule ---
 
     def init(self) -> bool:
         if self.T <= 0:
@@ -56,17 +56,17 @@ class OsmosisMonitor(BaseModule):
         if self.c_solute < 0:
             raise ValueError("c_solute cannot be negative")
         self._set_initialized(True)
+        self.logger.info("Инициализация завершена")
         return True
 
     def run(self) -> bool:
         if not self.is_initialized():
             raise RuntimeError("Module not initialized. Call init() first.")
 
-        # Осмотическое давление (Вант-Гофф)
         pi = self.c_solute * self.R_gas * self.T
-
-        # Напряжение в стенке сферической оболочки
         sigma = pi * self.R_shell / (2 * self.h_wall)
+
+        self.logger.info(f"Расчёт: c={self.c_solute}, T={self.T}, Pi={pi:.1f} Па, sigma={sigma:.1f} Па")
 
         self.results = {
             'pi_Pa': pi,
@@ -81,14 +81,15 @@ class OsmosisMonitor(BaseModule):
     def get_results(self) -> dict:
         return self.results
 
-    # --- Дополнительно ---
-
     def get_stress_Pa(self) -> float:
         """Возвращает напряжение в Па — для передачи в AcousticMonitor."""
         return self.results.get('sigma_Pa', 0.0)
 
     def print_report(self):
         r = self.results
+        self.logger.info(f"Па: {r['pi_Pa']:.1f} Па ({r['pi_kPa']:.2f} кПа)")
+        self.logger.info(f"Сигма: {r['sigma_Pa']:.1f} Па ({r['sigma_MPa']:.6f} МПа)")
+        self.logger.info(f"Концентрация: {r['c_solute']:.1f} | T = {r['T']:.1f} К")
         print(f"  Осмотическое давление: {r['pi_kPa']:.2f} кПа ({r['pi_Pa']:.1f} Па)")
         print(f"  Напряжение в стенке:   {r['sigma_MPa']:.4f} МПа ({r['sigma_Pa']:.1f} Па)")
         print(f"  Концентрация: {r['c_solute']:.1f} моль/м³  |  T = {r['T']:.1f} К")
