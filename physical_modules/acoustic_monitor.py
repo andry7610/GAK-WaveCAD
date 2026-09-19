@@ -134,4 +134,4 @@ class AcousticMonitor(BaseModule):
 
     def set_internal_stress(self, stress_Pa: float):
         self.internal_stress = stress_Pa
-        self.logger.info(f"Установлено напряжение: {stress_Pa:.1f} Па")
+        self.logger.info(f"Установлено напряжение: {stress_Pa:.1f} Па")-
