@@ -1,5 +1,16 @@
 modules:
   acoustic_monitor:
-    sample_rate: 44100
-    window_size: 2048
-    # другие параметры...
+    R: 0.05
+    rho: 1000.0
+    E: 2.0e+9
+    nu: 0.33
+    n_modes: 4
+    duration: 8.0
+    fs: 20000
+
+  osmosis_monitor:
+    c_solute: 300.0
+    T: 310.0
+    R_gas: 8.314
+    R_shell: 0.05
+    h_wall: 0.002
