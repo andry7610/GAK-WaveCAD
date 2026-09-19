@@ -1,5 +1,0 @@
-modules:
-  acoustic_monitor:
-    sample_rate: 44100
-    window_size: 2048
-    # другие параметры...
