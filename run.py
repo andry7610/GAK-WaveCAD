@@ -2,7 +2,7 @@
 GAK-WaveCAD — главная точка запуска.
 
 Загружает конфигурацию, инициализирует модули,
-запускает цепочку: осмос → термалка → акустика.
+запускает цепочку: осмос → термалка → акустика → коллапс.
 """
 
 import os
@@ -15,6 +15,7 @@ from core.logger import get_logger
 from physical_modules.osmosis_monitor import OsmosisMonitor
 from physical_modules.thermal_monitor import ThermalMonitor
 from physical_modules.acoustic_monitor import AcousticMonitor
+from physical_modules.born_collapse_monitor import BornCollapseMonitor
 
 
 def main():
@@ -38,7 +39,7 @@ def main():
     thermal.run()
     thermal.print_report()
 
-    # Суммарное напряжение
+    # Суммарное напряжение для акустики
     osm_stress = osmosis.get_stress_Pa()
     th_stress = thermal.get_thermal_stress_Pa()
     total_stress = osm_stress + th_stress
@@ -58,8 +59,18 @@ def main():
               f"f_meas={r['f_measured']:.1f} Гц, "
               f"dF={r['delta_f']:+.1f} Гц, {r['status']}")
 
-    logger.info("Цепочка выполнена: осмос → термалка → акустика")
+    # Модуль 4: коллапс
+    bc_cfg = config.get("born_collapse_monitor", {})
+    collapse = BornCollapseMonitor(bc_cfg)
+    osm_pressure = osmosis.results['pi_Pa']
+    collapse.set_external_pressure(osm_pressure)
+    collapse.init()
+    collapse.run()
+    collapse.print_report()
+
+    logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс")
 
 
 if __name__ == "__main__":
     main()
+
