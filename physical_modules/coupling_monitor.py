@@ -1,0 +1,168 @@
+"""
+Coupling Monitor — кросс-связи между всеми модулями системы.
+
+Модель:
+  Принимает результаты шести модулей и считает:
+    - магнитоупругую связь (акустика ↔ магноны)
+    - пьезоэлектрическую связь (акустика ↔ EM)
+    - магнитоэлектрическую связь (магноны ↔ EM)
+    - тепловой сдвиг осмоса (термалка ↔ осмос)
+    - влияние коллапса на геометрию (коллапс → все)
+  Выдаёт общий индекс стабильности (0..1).
+
+История:
+  v0.1 — базовая реализация
+"""
+
+import numpy as np
+
+from core.base_module import BaseModule
+from core.module_registry import ModuleRegistry
+from core.logger import get_logger
+
+
+@ModuleRegistry.register("coupling_monitor")
+class CouplingMonitor(BaseModule):
+    """Анализ кросс-связей между модулями системы."""
+
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config)
+
+        cfg = config or {}
+        self.B_me_scale = cfg.get("B_me_scale", kwargs.get("B_me_scale", 1.0))
+        self.alpha_me_scale = cfg.get("alpha_me_scale", kwargs.get("alpha_me_scale", 1.0))
+
+        # Результаты от других модулей
+        self.osmosis_results = None
+        self.thermal_results = None
+        self.acoustic_results = None
+        self.collapse_results = None
+        self.magnon_results = None
+        self.em_results = None
+
+        self.logger = get_logger("coupling_monitor")
+
+    def init(self) -> bool:
+        self._set_initialized(True)
+        self.logger.info("Инициализация Coupling Monitor")
+        return True
+
+    def set_results(self, osmosis=None, thermal=None, acoustic=None,
+                    collapse=None, magnon=None, em=None):
+        """Загрузить результаты от всех модулей."""
+        self.osmosis_results = osmosis
+        self.thermal_results = thermal
+        self.acoustic_results = acoustic
+        self.collapse_results = collapse
+        self.magnon_results = magnon
+        self.em_results = em
+        self.logger.info("Результаты загружены от всех модулей")
+
+    def run(self) -> bool:
+        if not self.is_initialized():
+            raise RuntimeError("Module not initialized. Call init() first.")
+
+        results = {}
+
+        # --- 1. Магнитоупругая связь: акустика ↔ магноны ---
+        # Насколько сильно акустическая мода сдвигает магнонные частоты
+        if self.acoustic_results and self.magnon_results:
+            ac_shifts = [r.get('delta_f', 0) for r in self.acoustic_results.values()]
+            mag_shifts = [r.get('df_stress', 0) for r in self.magnon_results.values()]
+            ac_norm = np.sqrt(np.mean(np.square(ac_shifts)))
+            mag_norm = np.sqrt(np.mean(np.square(mag_shifts)))
+            k_magnetoelastic = ac_norm * mag_norm / (ac_norm + mag_norm + 1e-30)
+            results['k_magnetoelastic'] = k_magnetoelastic
+        else:
+            results['k_magnetoelastic'] = 0.0
+
+        # --- 2. Пьезоэлектрическая связь: акустика ↔ EM ---
+        if self.acoustic_results and self.em_results:
+            ac_shifts = [r.get('delta_f', 0) for r in self.acoustic_results.values()]
+            em_shifts = [r.get('df_stress', 0) for r in self.em_results.values()]
+            ac_norm = np.sqrt(np.mean(np.square(ac_shifts)))
+            em_norm = np.sqrt(np.mean(np.square(em_shifts)))
+            k_piezo = ac_norm * em_norm / (ac_norm + em_norm + 1e-30)
+            results['k_piezoelectric'] = k_piezo
+        else:
+            results['k_piezoelectric'] = 0.0
+
+        # --- 3. Магнитоэлектрическая связь: магноны ↔ EM ---
+        if self.magnon_results and self.em_results:
+            mag_freqs = [r.get('f', 0) for r in self.magnon_results.values()]
+            em_freqs = [r.get('f_shifted', 0) for r in self.em_results.values()]
+            mag_mean = np.mean(mag_freqs)
+            em_mean = np.mean(em_freqs)
+            k_me = abs(mag_mean - em_mean) / (mag_mean + em_mean + 1e-30)
+            results['k_magnetoelectric'] = k_me * self.alpha_me_scale
+        else:
+            results['k_magnetoelectric'] = 0.0
+
+        # --- 4. Тепловой сдвиг осмоса: термалка ↔ осмос ---
+        if self.osmosis_results and self.thermal_results:
+            sigma_osm = self.osmosis_results.get('sigma_Pa', 0)
+            sigma_th = self.thermal_results.get('sigma_thermal_Pa', 0)
+            total = sigma_osm + sigma_th + 1e-30
+            k_thermal_osmosis = sigma_th / total
+            results['k_thermal_osmosis'] = k_thermal_osmosis
+        else:
+            results['k_thermal_osmosis'] = 0.0
+
+        # --- 5. Влияние коллапса на геометрию ---
+        if self.collapse_results:
+            phase = self.collapse_results.get('phase', 'STABLE')
+            ratio = self.collapse_results.get('ratio', 0.0)
+            # Геометрический фактор: 1 (устойчив) → 0 (коллапс)
+            if phase == 'COLLAPSE':
+                geom_factor = 0.0
+            elif phase == 'WARNING':
+                geom_factor = 1.0 - ratio
+            elif phase == 'INFLATION':
+                geom_factor = 1.0
+            else:
+                geom_factor = 1.0 - 0.5 * ratio
+            results['geom_factor'] = max(0.0, min(1.0, geom_factor))
+            results['collapse_phase'] = phase
+            results['collapse_ratio'] = ratio
+        else:
+            results['geom_factor'] = 1.0
+            results['collapse_phase'] = 'UNKNOWN'
+            results['collapse_ratio'] = 0.0
+
+        # --- 6. Общий индекс стабильности ---
+        # Взвешенная сумма всех факторов
+        stability = (
+            results['geom_factor'] * 0.30 +
+            (1.0 - min(results['k_magnetoelastic'], 1.0)) * 0.20 +
+            (1.0 - min(results['k_piezoelectric'], 1.0)) * 0.20 +
+            (1.0 - min(results['k_magnetoelectric'], 1.0)) * 0.15 +
+            (1.0 - min(results['k_thermal_osmosis'], 1.0)) * 0.15
+        )
+
+        if stability > 0.7:
+            system_status = "HEALTHY"
+        elif stability > 0.4:
+            system_status = "DEGRADED"
+        else:
+            system_status = "CRITICAL"
+
+        results['stability_index'] = stability
+        results['system_status'] = system_status
+
+        self.logger.info(f"Stability={stability:.3f}, status={system_status}")
+        self.results = results
+        return True
+
+    def get_results(self) -> dict:
+        return self.results
+
+    def print_report(self):
+        print("\n  Coupling Monitor — отчёт:")
+        print(f"    k_magnetoelastic  : {self.results['k_magnetoelastic']:.4e}")
+        print(f"    k_piezoelectric   : {self.results['k_piezoelectric']:.4e}")
+        print(f"    k_magnetoelectric : {self.results['k_magnetoelectric']:.4e}")
+        print(f"    k_thermal_osmosis : {self.results['k_thermal_osmosis']:.4f}")
+        print(f"    geom_factor       : {self.results['geom_factor']:.3f}")
+        print(f"    collapse_phase    : {self.results['collapse_phase']}")
+        print(f"    stability_index   : {self.results['stability_index']:.3f}")
+        print(f"    system_status     : {self.results['system_status']}")
