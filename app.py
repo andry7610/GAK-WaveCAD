@@ -59,6 +59,7 @@ st.sidebar.header("🧲 Магноны (YIG)")
 
 B0 = st.sidebar.slider("Поле B₀, Т", 0.05, 2.0, 0.3, 0.01)
 lambda_s = st.sidebar.slider("Магнитострикция λ_s, ppm", 1.0, 50.0, 25.0, 1.0) * 1e-6
+alpha_bar = st.sidebar.slider("Затухание Гилберта α", 0.001, 0.1, 0.01, 0.001)
 
 st.sidebar.header("⚡ EM-резонанс")
 
