@@ -27,8 +27,22 @@ jobs:
           python -m pip install numpy scipy pytest pyyaml
 
       - name: Run acoustic test
-        run: |
-          python run_acoustic_test.py
+        run: python run_acoustic_test.py
+
+      - name: Run born collapse test
+        run: python run_born_collapse_test.py
+
+      - name: Run coupling test
+        run: python run_coupling_test.py
+
+      - name: Run EM resonance test
+        run: python run_em_resonance_test.py
+
+      - name: Run magnon test
+        run: python run_magnon_test.py
+
+      - name: Run thermal test
+        run: python run_thermal_test.py
 
       - name: Run pytest
         env:
