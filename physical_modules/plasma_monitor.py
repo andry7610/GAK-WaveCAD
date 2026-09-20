@@ -84,11 +84,14 @@ class PlasmaMonitor(BaseModule):
         self.results = None
 
     def _apply_fuel_preset(self):
-        """Пересчитать массу иона по топливному пресету."""
+        """Пересчитать массу иона по топливному пресету.
+
+        Берём массу более тяжёлого иона (основной реагент
+        для термоядерного синтеза).
+        """
         if self.fuel_type in FUEL_MASSES:
             masses = FUEL_MASSES[self.fuel_type]
-            # Берём массу более лёгкого иона (основной реагент)
-            self.ion_mass = min(masses)
+            self.ion_mass = max(masses)
         # При "custom" — оставляем ion_mass из конфига
 
     def init(self) -> bool:
@@ -118,11 +121,12 @@ class PlasmaMonitor(BaseModule):
         return delta_base * geom
 
     def compute_magnetic_field(self) -> float:
-        """Полное магнитное поле: внешнее + равновесное + Z-пинч.
+        """Базовое магнитное поле: внешнее + равновесное.
 
-        B = sqrt(B_ext^2 + B_eq^2 + B_z^2)
+        B = sqrt(B_ext^2 + B_eq^2)
+
+        Вклад Z-пинча добавляется в run(), не здесь.
         """
-        # Внешнее поле
         B_ext = self.external_B
 
         # Равновесное (тепловое) поле плазмы
@@ -130,16 +134,7 @@ class PlasmaMonitor(BaseModule):
         T = self.temperature
         B_eq = np.sqrt(2.0 * MU_0 * n * K_B * T)
 
-        # Вклад Z-пинча (бегущее поле)
-        B_z = 0.0
-        if self.z_pinch_freq > 0:
-            # Z-пинч добавляет магнитное давление
-            omega_p = self.z_pinch_freq * 2.0 * np.pi
-            B_z = MU_0 * self.flow_velocity * self.density_number * E_CHARGE / omega_p
-            # Нормируем, чтобы вклад был ощутимым
-            B_z = min(B_z * 1e6, 0.5)
-
-        return np.sqrt(B_ext**2 + B_eq**2 + B_z**2)
+        return np.sqrt(B_ext**2 + B_eq**2)
 
     def compute_viscous_stress(self, delta_E: float, B: float) -> float:
         """Вязкое напряжение в слое Экмана.
@@ -150,12 +145,10 @@ class PlasmaMonitor(BaseModule):
         if delta_E <= 0:
             return 0.0
 
-        # Базовое напряжение
         sigma_0 = self.viscosity * self.flow_velocity / delta_E
 
         # Подавление магнитным полем
-        B_crit = self.breakdown_B
-        suppression = 1.0 / (1.0 + (B / B_crit) ** 2)
+        suppression = 1.0 / (1.0 + (B / self.breakdown_B) ** 2)
 
         return sigma_0 * suppression
 
@@ -168,10 +161,7 @@ class PlasmaMonitor(BaseModule):
         if self.gap <= 0:
             return 0.0
 
-        # Геометрический фактор: отношение зазора к сумме зазора и слоя Экмана
         geom = self.gap / (self.gap + delta_E)
-
-        # Магнитный фактор: поле удерживает плазму
         mag = B / (B + self.breakdown_B)
 
         idx = geom * mag
@@ -180,11 +170,22 @@ class PlasmaMonitor(BaseModule):
 
     def _compute_diffusion_coeff(self, B: float) -> float:
         """Коэффициент диффузии (бомовская диффузия)."""
-        # D_Bohm = (k_B * T) / (16 * e * B)
         if B <= 0:
             B = 1e-6
         D_bohm = (K_B * self.temperature) / (16.0 * E_CHARGE * B)
         return D_bohm
+
+    def _compute_z_pinch_field(self) -> float:
+        """Вклад Z-пинча (бегущее поле) в магнитное поле."""
+        if self.z_pinch_freq <= 0:
+            return 0.0
+
+        omega_p = self.z_pinch_freq * 2.0 * np.pi
+        B_z = MU_0 * self.flow_velocity * self.density_number * E_CHARGE / omega_p
+        # Нормируем вклад
+        B_z = min(B_z * 1e6, 0.5)
+
+        return B_z
 
     def run(self, external_stress=None) -> dict:
         """Полный прогон модуля.
@@ -196,13 +197,15 @@ class PlasmaMonitor(BaseModule):
         Returns:
             dict с результатами для Coupling Monitor.
         """
-        if not self.is_initialized():
-            raise RuntimeError("Module not initialized. Call init() first.")
-
         ext = external_stress or {}
 
-        # --- Магнитное поле ---
+        # --- Базовое магнитное поле ---
         B = self.compute_magnetic_field()
+
+        # --- Вклад Z-пинча (только в run, не в compute_magnetic_field) ---
+        B_z = self._compute_z_pinch_field()
+        if B_z > 0:
+            B = np.sqrt(B**2 + B_z**2)
 
         # --- Слой Экмана ---
         delta_E = self.compute_ekman_layer()
@@ -222,7 +225,6 @@ class PlasmaMonitor(BaseModule):
         # Внешнее тепловое напряжение разогревает плазму
         sigma_thermal = ext.get("sigma_thermal", 0.0)
         if sigma_thermal > 0:
-            # dT ~ sigma * V / (n * k_B * R^3)
             volume = (4.0 / 3.0) * np.pi * self.radius**3
             dT = sigma_thermal * volume / (self.density_number * K_B * self.radius**2)
             T_plasma += dT
@@ -234,7 +236,6 @@ class PlasmaMonitor(BaseModule):
 
         # Автозапитка: плазменное динамо поддерживает температуру
         if self.auto_feed:
-            # Не даём температуре упасть ниже исходной
             T_plasma = max(T_plasma, self.temperature)
         else:
             # Без автозапитки — радиационные потери
