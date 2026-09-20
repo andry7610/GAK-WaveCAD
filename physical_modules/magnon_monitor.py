@@ -134,3 +134,4 @@ class MagnonMonitor(BaseModule):
             print(f"    {key:14s} : f={r['f']:.3e} Гц, "
                   f"df_stress={r['df_stress']:+.3e} Гц, "
                   f"Q={r['Q']:.0f}, dF={r['delta_f']:.2e} Гц")
+
