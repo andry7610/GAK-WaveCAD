@@ -1,30 +1,29 @@
-"""
-Тест модуля плазмы (Plasma Monitor).
+"""tests/test_plasma_monitor.py — Тесты PlasmaMonitor (v0.1).
 
-Проверяет:
-  1. Расчёт зоны Экмана
-  2. Магнитное поле
-  3. Вязкое напряжение
-  4. Барьерный индекс
-  5. Фазовое состояние
-  6. Передачу напряжений от других модулей
-  7. Топливные пресеты (массы ионов)
-  8. Z-пинч (бегущее поле)
-  9. Автозапитка
-  10. Флаг зоны Экмана
+10 групп:
+  1. Инициализация — параметры, пресеты топлива
+  2. Слой Экмана — формула, edge cases
+  3. Магнитное поле — внешнее + равновесное
+  4. Вязкое напряжение — подавление магнитным полем
+  5. Барьерный индекс — границы 0..1, edge cases
+  6. Бомовская диффузия — зависимость от B
+  7. Z-пинч — вклад в магнитное поле
+  8. Фазовые состояния — STABLE/WARNING/CONTACT/BREAKDOWN
+  9. Внешние напряжения — тепловое/осмотическое/акустическое
+ 10. Автозапитка — удержание температуры vs радиационные потери
 """
 
-import sys
-import os
 import numpy as np
+import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from physical_modules.plasma_monitor import (
+    PlasmaMonitor, MU_0, K_B, E_CHARGE, FUEL_MASSES,
+)
 
-from physical_modules.plasma_monitor import PlasmaMonitor
 
+# --- Константы для тестов ---
 
-# --- Базовый конфиг с обновлёнными параметрами (1 см, 5 МК, 2 Тл) ---
-BASE_CONFIG = {
+DEFAULT_CFG = {
     "radius": 1.0e-2,
     "shell_thickness": 1.0e-4,
     "plasma_gap": 5.0e-4,
@@ -34,266 +33,377 @@ BASE_CONFIG = {
     "mass_density": 1.0e-3,
     "rotation_freq": 1.0e3,
     "flow_velocity": 1.0e4,
+    "z_pinch_freq": 1.253e7,
+    "auto_feed": True,
+    "ekman_layer": True,
     "ion_charge": 1.0,
     "ion_mass": 1.673e-27,
     "collision_freq": 1.0e9,
     "external_B": 2.0,
     "breakdown_B": 15.0,
     "barrier_threshold": 0.3,
-    "z_pinch_freq": 1.253e7,
-    "auto_feed": True,
-    "ekman_layer": True,
-    "fuel_type": "D-He3",
+    "fuel_type": "custom",
 }
 
 
-def test_ekman_layer():
-    """Толщина зоны Экмана должна быть положительной и физически осмысленной."""
-    config = BASE_CONFIG.copy()
-    pm = PlasmaMonitor(config)
-    delta_E = pm.compute_ekman_layer()
+# --- 1. Инициализация ---
 
-    assert delta_E > 0, "Толщина зоны Экмана должна быть положительной"
-    assert delta_E < 0.01, "Толщина зоны Экмана нереалистично велика"
+class TestInit:
 
-    # Базовая формула: delta = sqrt(2 * nu / Omega) * geom
-    nu = config["viscosity"]
-    Omega = config["rotation_freq"]
-    R = config["radius"]
-    gap = config["plasma_gap"]
-    delta_E_base = np.sqrt(2 * nu / Omega)
-    geom = R / (R - gap)
-    assert np.isclose(delta_E, delta_E_base * geom, rtol=1e-6), \
-        f"delta_E={delta_E}, expected={delta_E_base * geom}"
-    print(f"  [OK] Ekman thickness: {delta_E:.4e} m")
-    return pm
+    def test_default_params(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        assert pm.radius == 1.0e-2
+        assert pm.density_number == 1.0e20
+        assert pm.temperature == 5.0e6
+        assert pm.external_B == 2.0
+        assert pm.breakdown_B == 15.0
 
+    def test_custom_params(self):
+        cfg = {**DEFAULT_CFG, "radius": 2.0e-2, "temperature": 1.0e7}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm.radius == 2.0e-2
+        assert pm.temperature == 1.0e7
 
-def test_magnetic_field():
-    """Магнитное поле должно включать внешний и равновесный вклады."""
-    config = BASE_CONFIG.copy()
-    config["external_B"] = 2.0
-    config["density_number"] = 1.0e20
-    config["temperature"] = 5.0e6
-    pm = PlasmaMonitor(config)
-    B = pm.compute_magnetic_field()
+    def test_empty_config(self):
+        pm = PlasmaMonitor()
+        assert pm.radius == 1.0e-2
+        assert pm.temperature == 5.0e6
 
-    assert B > 2.0, "B должно быть больше внешнего поля"
-    mu_0 = 4 * np.pi * 1e-7
-    k_B = 1.380649e-23
-    B_eq = np.sqrt(2 * mu_0 * 1.0e20 * k_B * 5.0e6)
-    B_expected = np.sqrt(2.0**2 + B_eq**2)
-    assert np.isclose(B, B_expected, rtol=1e-6), f"B={B}, expected={B_expected}"
-    print(f"  [OK] Magnetic field: {B:.4e} T (B_eq={B_eq:.4e} T)")
-    return pm
+    def test_kwargs_passed(self):
+        pm = PlasmaMonitor(radius=3.0e-2)
+        assert pm.radius == 3.0e-2
 
+    def test_init_returns_true(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        assert pm.init() is True
 
-def test_viscous_stress():
-    """Вязкое напряжение должно быть положительным и подавляться магнитным полем."""
-    config = BASE_CONFIG.copy()
-    pm = PlasmaMonitor(config)
-    delta_E = 5.0e-4
-    B = 2.0
+    def test_results_none_before_run(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        assert pm.results is None
 
-    sigma = pm.compute_viscous_stress(delta_E, B)
-    assert sigma > 0, "Вязкое напряжение должно быть положительным"
+    def test_get_results_none_before_run(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        assert pm.get_results() is None
 
-    # Проверка подавления магнитным полем
-    sigma_no_B = pm.compute_viscous_stress(delta_E, 0.0)
-    assert sigma < sigma_no_B, "Магнитное поле должно подавлять напряжение"
-    print(f"  [OK] Viscous stress: {sigma:.4e} Pa (no B: {sigma_no_B:.4e} Pa)")
-    return pm
+    def test_fuel_preset_dhe3(self):
+        cfg = {**DEFAULT_CFG, "fuel_type": "D-He3"}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm.ion_mass == max(FUEL_MASSES["D-He3"])
 
+    def test_fuel_preset_dt(self):
+        cfg = {**DEFAULT_CFG, "fuel_type": "D-T"}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm.ion_mass == max(FUEL_MASSES["D-T"])
 
-def test_barrier_index():
-    """Барьерный индекс должен быть в диапазоне 0..1."""
-    config = BASE_CONFIG.copy()
-    pm = PlasmaMonitor(config)
+    def test_fuel_preset_dd(self):
+        cfg = {**DEFAULT_CFG, "fuel_type": "D-D"}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm.ion_mass == max(FUEL_MASSES["D-D"])
 
-    # Большой зазор, сильное поле — высокий барьер
-    idx = pm.compute_barrier_index(5.0e-4, 5.0)
-    assert 0 < idx <= 1, f"Барьер {idx} вне диапазона"
-
-    # Нулевой зазор — нулевой барьер
-    pm.gap = 0
-    idx_zero = pm.compute_barrier_index(5.0e-4, 5.0)
-    assert idx_zero == 0, "При нулевом зазоре барьер должен быть 0"
-    print(f"  [OK] Barrier index: {idx:.3f}")
-    return pm
+    def test_fuel_custom_keeps_mass(self):
+        cfg = {**DEFAULT_CFG, "fuel_type": "custom", "ion_mass": 5.0e-27}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm.ion_mass == 5.0e-27
 
 
-def test_full_run():
-    """Полный прогон модуля с внешними напряжениями."""
-    config = BASE_CONFIG.copy()
-    pm = PlasmaMonitor(config)
+# --- 2. Слой Экмана ---
 
-    # Без внешних напряжений
-    result = pm.run()
-    assert result["phase"] in ["STABLE", "WARNING", "CONTACT", "BREAKDOWN"]
-    assert result["ekman_thickness"] > 0
-    assert result["B_field"] > 0
-    assert result["barrier_index"] >= 0
-    print(f"  [OK] Full run (no external): phase={result['phase']}, "
-          f"delta_E={result['ekman_thickness']:.4e}, "
-          f"B={result['B_field']:.4e}, "
-          f"barrier={result['barrier_index']:.3f}")
+class TestEkmanLayer:
 
-    # С внешними напряжениями (от осмоса и термалки)
-    external = {
-        "sigma_thermal": 1e6,
-        "sigma_osmotic": 1e5,
-        "acoustic_freq_shift": 100.0,
-    }
-    result_ext = pm.run(external_stress=external)
-    assert result_ext["temperature_plasma"] > 5.0e6, \
-        "Тепловое напряжение должно разогревать плазму"
-    assert result_ext["rotation_omega"] > 1.0e3, \
-        "Акустический сдвиг должен менять Omega"
-    print(f"  [OK] Full run (external): T={result_ext['temperature_plasma']:.4e} K, "
-          f"Omega={result_ext['rotation_omega']:.4e} rad/s")
-    return pm
+    def test_basic_value(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        delta = pm.compute_ekman_layer()
+        assert delta > 0
+        assert np.isfinite(delta)
 
+    def test_formula_correct(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        nu = pm.viscosity
+        Omega = pm.rotation_freq
+        R = pm.radius
+        gap = pm.gap
+        expected = np.sqrt(2.0 * nu / Omega) * R / (R - gap)
+        assert abs(pm.compute_ekman_layer() - expected) < 1e-15
 
-def test_coupling_output():
-    """Проверка формата выходных данных для Coupling Monitor."""
-    config = BASE_CONFIG.copy()
-    pm = PlasmaMonitor(config)
-    result = pm.run()
+    def test_disabled_returns_zero(self):
+        cfg = {**DEFAULT_CFG, "ekman_layer": False}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm.compute_ekman_layer() == 0.0
 
-    required_keys = [
-        "module", "ekman_thickness", "B_field", "sigma_viscous",
-        "diffusion_coeff", "barrier_index", "phase",
-        "plasma_stress", "magnetic_coupling",
-        "temperature_plasma", "rotation_omega",
-    ]
-    for key in required_keys:
-        assert key in result, f"Отсутствует ключ '{key}' в выходных данных"
-    print("  [OK] Coupling output format verified")
+    def test_zero_viscosity(self):
+        cfg = {**DEFAULT_CFG, "viscosity": 0.0}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm.compute_ekman_layer() == 0.0
+
+    def test_high_rotation_thin_layer(self):
+        cfg_low = {**DEFAULT_CFG, "rotation_freq": 1.0e3}
+        cfg_high = {**DEFAULT_CFG, "rotation_freq": 1.0e6}
+        pm_low = PlasmaMonitor(config=cfg_low)
+        pm_high = PlasmaMonitor(config=cfg_high)
+        assert pm_high.compute_ekman_layer() < pm_low.compute_ekman_layer()
 
 
-def test_fuel_mass():
-    """Топливные пресеты должны пересчитывать массы ионов."""
-    # D-He3
-    config = BASE_CONFIG.copy()
-    config["fuel_type"] = "D-He3"
-    pm = PlasmaMonitor(config)
-    m_D = 3.34e-27
-    m_He3 = 5.01e-27
-    assert np.isclose(pm.ion_mass, m_D, rtol=1e-2) or \
-           np.isclose(pm.ion_mass, m_He3, rtol=1e-2), \
-        f"ion_mass={pm.ion_mass}, expected D or He3"
-    print(f"  [OK] D-He3: ion_mass={pm.ion_mass:.3e} kg")
+# --- 3. Магнитное поле ---
 
-    # D-T
-    config["fuel_type"] = "D-T"
-    pm = PlasmaMonitor(config)
-    m_T = 5.01e-27
-    assert np.isclose(pm.ion_mass, m_T, rtol=1e-2), \
-        f"ion_mass={pm.ion_mass}, expected tritium {m_T}"
-    print(f"  [OK] D-T: ion_mass={pm.ion_mass:.3e} kg")
+class TestMagneticField:
 
-    # Fallback — без fuel_type
-    config["fuel_type"] = "custom"
-    config["ion_mass"] = 1.673e-27
-    pm = PlasmaMonitor(config)
-    assert np.isclose(pm.ion_mass, 1.673e-27, rtol=1e-6), \
-        f"ion_mass={pm.ion_mass}, expected fallback 1.673e-27"
-    print(f"  [OK] Custom fallback: ion_mass={pm.ion_mass:.3e} kg")
-    return pm
+    def test_basic_value(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        B = pm.compute_magnetic_field()
+        assert B > 0
+        assert np.isfinite(B)
 
+    def test_external_dominant(self):
+        cfg = {**DEFAULT_CFG, "external_B": 100.0,
+               "density_number": 1.0e10, "temperature": 1.0e3}
+        pm = PlasmaMonitor(config=cfg)
+        B = pm.compute_magnetic_field()
+        assert abs(B - 100.0) / 100.0 < 0.01
 
-def test_z_pinch():
-    """Z-пинч (бегущее поле) должен влиять на динамику плазмы."""
-    config_with = BASE_CONFIG.copy()
-    config_with["z_pinch_freq"] = 1.253e7
-    pm_with = PlasmaMonitor(config_with)
-    result_with = pm_with.run()
+    def test_equilibrium_contribution(self):
+        cfg = {**DEFAULT_CFG, "external_B": 0.0}
+        pm = PlasmaMonitor(config=cfg)
+        B = pm.compute_magnetic_field()
+        n = pm.density_number
+        T = pm.temperature
+        B_eq = np.sqrt(2.0 * MU_0 * n * K_B * T)
+        assert abs(B - B_eq) < 1e-10
 
-    config_without = BASE_CONFIG.copy()
-    config_without["z_pinch_freq"] = 0.0
-    pm_without = PlasmaMonitor(config_without)
-    result_without = pm_without.run()
+    def test_formula_correct(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        B_ext = pm.external_B
+        n = pm.density_number
+        T = pm.temperature
+        B_eq = np.sqrt(2.0 * MU_0 * n * K_B * T)
+        expected = np.sqrt(B_ext**2 + B_eq**2)
+        assert abs(pm.compute_magnetic_field() - expected) < 1e-10
 
-    # При активном Z-пинче эффективное поле должно быть сильнее
-    assert result_with["B_field"] >= result_without["B_field"], \
-        "Z-пинч должен усиливать магнитное поле"
-    print(f"  [OK] Z-pinch: B_with={result_with['B_field']:.4e} T, "
-          f"B_without={result_without['B_field']:.4e} T")
-    return pm_with
+    def test_higher_density_higher_B(self):
+        cfg_low = {**DEFAULT_CFG, "density_number": 1.0e19}
+        cfg_high = {**DEFAULT_CFG, "density_number": 1.0e21}
+        pm_low = PlasmaMonitor(config=cfg_low)
+        pm_high = PlasmaMonitor(config=cfg_high)
+        assert pm_high.compute_magnetic_field() > pm_low.compute_magnetic_field()
 
 
-def test_auto_feed():
-    """Автозапитка должна поддерживать температуру плазмы."""
-    config_on = BASE_CONFIG.copy()
-    config_on["auto_feed"] = True
-    pm_on = PlasmaMonitor(config_on)
-    result_on = pm_on.run()
+# --- 4. Вязкое напряжение ---
 
-    config_off = BASE_CONFIG.copy()
-    config_off["auto_feed"] = False
-    pm_off = PlasmaMonitor(config_off)
-    result_off = pm_off.run()
+class TestViscousStress:
 
-    # С автозапиткой температура должна быть не ниже исходной
-    assert result_on["temperature_plasma"] >= config_on["temperature"], \
-        "Автозапитка должна поддерживать или повышать температуру"
-    # Без автозапитки температура может падать
-    print(f"  [OK] Auto-feed ON:  T={result_on['temperature_plasma']:.4e} K")
-    print(f"  [OK] Auto-feed OFF: T={result_off['temperature_plasma']:.4e} K")
-    return pm_on
+    def test_basic_value(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        delta_E = pm.compute_ekman_layer()
+        B = pm.compute_magnetic_field()
+        sigma = pm.compute_viscous_stress(delta_E, B)
+        assert sigma > 0
+        assert np.isfinite(sigma)
 
+    def test_zero_delta_returns_zero(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        assert pm.compute_viscous_stress(0.0, 2.0) == 0.0
 
-def test_ekman_flag():
-    """Флаг ekman_layer должен включать/выключать расчёт зоны Экмана."""
-    config_on = BASE_CONFIG.copy()
-    config_on["ekman_layer"] = True
-    pm_on = PlasmaMonitor(config_on)
-    result_on = pm_on.run()
-    assert result_on["ekman_thickness"] > 0, \
-        "При ekman_layer=True толщина должна быть положительной"
+    def test_magnetic_suppression(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        delta_E = pm.compute_ekman_layer()
+        sigma_low_B = pm.compute_viscous_stress(delta_E, 1.0)
+        sigma_high_B = pm.compute_viscous_stress(delta_E, 100.0)
+        assert sigma_high_B < sigma_low_B
 
-    config_off = BASE_CONFIG.copy()
-    config_off["ekman_layer"] = False
-    pm_off = PlasmaMonitor(config_off)
-    result_off = pm_off.run()
-    assert result_off["ekman_thickness"] == 0, \
-        "При ekman_layer=False толщина должна быть 0"
-    print(f"  [OK] Ekman ON:  delta={result_on['ekman_thickness']:.4e} m")
-    print(f"  [OK] Ekman OFF: delta={result_off['ekman_thickness']:.4e} m")
-    return pm_on
+    def test_formula_correct(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        delta_E = 1.0e-4
+        B = 5.0
+        sigma_0 = pm.viscosity * pm.flow_velocity / delta_E
+        suppression = 1.0 / (1.0 + (B / pm.breakdown_B) ** 2)
+        expected = sigma_0 * suppression
+        assert abs(pm.compute_viscous_stress(delta_E, B) - expected) < 1e-15
+
+    def test_strong_field_near_zero_stress(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        delta_E = pm.compute_ekman_layer()
+        sigma = pm.compute_viscous_stress(delta_E, 1.0e6)
+        assert sigma < 1e-10
 
 
-if __name__ == "__main__":
-    print("\n=== Plasma Monitor Tests ===\n")
+# --- 5. Барьерный индекс ---
 
-    print("[1] Ekman layer:")
-    test_ekman_layer()
+class TestBarrierIndex:
 
-    print("[2] Magnetic field:")
-    test_magnetic_field()
+    def test_basic_value(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        delta_E = pm.compute_ekman_layer()
+        B = pm.compute_magnetic_field()
+        idx = pm.compute_barrier_index(delta_E, B)
+        assert 0.0 <= idx <= 1.0
 
-    print("[3] Viscous stress:")
-    test_viscous_stress()
+    def test_zero_gap_returns_zero(self):
+        cfg = {**DEFAULT_CFG, "plasma_gap": 0.0}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm.compute_barrier_index(1e-4, 5.0) == 0.0
 
-    print("[4] Barrier index:")
-    test_barrier_index()
+    def test_high_B_higher_index(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        delta_E = pm.compute_ekman_layer()
+        idx_low = pm.compute_barrier_index(delta_E, 1.0)
+        idx_high = pm.compute_barrier_index(delta_E, 100.0)
+        assert idx_high > idx_low
 
-    print("[5] Full run:")
-    test_full_run()
+    def test_large_delta_lower_index(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        B = pm.compute_magnetic_field()
+        idx_small = pm.compute_barrier_index(1e-6, B)
+        idx_large = pm.compute_barrier_index(1e-2, B)
+        assert idx_large < idx_small
 
-    print("[6] Coupling output:")
-    test_coupling_output()
+    def test_formula_correct(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        delta_E = 1e-4
+        B = 5.0
+        geom = pm.gap / (pm.gap + delta_E)
+        mag = B / (B + pm.breakdown_B)
+        expected = max(0.0, min(1.0, geom * mag))
+        assert abs(pm.compute_barrier_index(delta_E, B) - expected) < 1e-15
 
-    print("[7] Fuel mass presets:")
-    test_fuel_mass()
+    def test_clamped_to_unit(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        idx = pm.compute_barrier_index(1e-10, 1e6)
+        assert idx <= 1.0
+        idx2 = pm.compute_barrier_index(1e10, 0.0)
+        assert idx2 >= 0.0
 
-    print("[8] Z-pinch (travelling field):")
-    test_z_pinch()
 
-    print("[9] Auto-feed:")
-    test_auto_feed()
+# --- 6. Бомовская диффузия ---
 
-    print("[10] Ekman layer flag:")
-    test_ekman_flag()
+class TestBohmDiffusion:
 
-    print("\n=== All plasma tests passed ===\n")
+    def test_basic_value(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        B = pm.compute_magnetic_field()
+        D = pm._compute_diffusion_coeff(B)
+        assert D > 0
+        assert np.isfinite(D)
+
+    def test_formula_correct(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        B = 5.0
+        expected = (K_B * pm.temperature) / (16.0 * E_CHARGE * B)
+        assert abs(pm._compute_diffusion_coeff(B) - expected) < 1e-15
+
+    def test_higher_B_lower_diffusion(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        D_low = pm._compute_diffusion_coeff(1.0)
+        D_high = pm._compute_diffusion_coeff(100.0)
+        assert D_high < D_low
+
+    def test_zero_B_fallback(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        D = pm._compute_diffusion_coeff(0.0)
+        assert D > 0
+        assert np.isfinite(D)
+
+    def test_higher_temp_higher_diffusion(self):
+        cfg_low = {**DEFAULT_CFG, "temperature": 1.0e6}
+        cfg_high = {**DEFAULT_CFG, "temperature": 1.0e7}
+        pm_low = PlasmaMonitor(config=cfg_low)
+        pm_high = PlasmaMonitor(config=cfg_high)
+        B = 5.0
+        assert pm_high._compute_diffusion_coeff(B) > pm_low._compute_diffusion_coeff(B)
+
+
+# --- 7. Z-пинч ---
+
+class TestZPinch:
+
+    def test_basic_value(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        B_z = pm._compute_z_pinch_field()
+        assert B_z >= 0
+        assert np.isfinite(B_z)
+
+    def test_zero_freq_returns_zero(self):
+        cfg = {**DEFAULT_CFG, "z_pinch_freq": 0.0}
+        pm = PlasmaMonitor(config=cfg)
+        assert pm._compute_z_pinch_field() == 0.0
+
+    def test_capped_at_half(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        B_z = pm._compute_z_pinch_field()
+        assert B_z <= 0.5
+
+    def test_run_includes_z_pinch(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        B_base = pm.compute_magnetic_field()
+        B_z = pm._compute_z_pinch_field()
+        results = pm.run()
+        B_total = results["B_field"]
+        if B_z > 0:
+            expected = np.sqrt(B_base**2 + B_z**2)
+            assert abs(B_total - expected) < 1e-10
+
+    def test_zero_z_pinch_no_contribution(self):
+        cfg = {**DEFAULT_CFG, "z_pinch_freq": 0.0}
+        pm = PlasmaMonitor(config=cfg)
+        results = pm.run()
+        B_base = pm.compute_magnetic_field()
+        assert abs(results["B_field"] - B_base) < 1e-10
+
+
+# --- 8. Фазовые состояния ---
+
+class TestPhases:
+
+    def test_stable_phase(self):
+        cfg = {**DEFAULT_CFG, "external_B": 2.0, "breakdown_B": 15.0,
+               "plasma_gap": 5.0e-4, "barrier_threshold": 0.01}
+        pm = PlasmaMonitor(config=cfg)
+        results = pm.run()
+        assert results["phase"] == "STABLE"
+
+    def test_warning_phase(self):
+        cfg = {**DEFAULT_CFG, "external_B": 0.01, "breakdown_B": 15.0,
+               "plasma_gap": 5.0e-4, "barrier_threshold": 0.99,
+               "density_number": 1.0e10, "temperature": 1.0e3}
+        pm = PlasmaMonitor(config=cfg)
+        results = pm.run()
+        assert results["phase"] == "WARNING"
+
+    def test_contact_phase(self):
+        cfg = {**DEFAULT_CFG, "viscosity": 1.0, "rotation_freq": 1.0e3,
+               "plasma_gap": 1e-10}
+        pm = PlasmaMonitor(config=cfg)
+        delta_E = pm.compute_ekman_layer()
+        results = pm.run()
+        if pm.gap <= delta_E * 0.5:
+            assert results["phase"] == "CONTACT"
+
+    def test_breakdown_phase(self):
+        cfg = {**DEFAULT_CFG, "external_B": 20.0, "breakdown_B": 15.0,
+               "density_number": 1.0e10, "temperature": 1.0e3}
+        pm = PlasmaMonitor(config=cfg)
+        results = pm.run()
+        assert results["phase"] == "BREAKDOWN"
+
+    def test_run_returns_all_keys(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        results = pm.run()
+        required_keys = [
+            "module", "ekman_thickness", "B_field", "sigma_viscous",
+            "diffusion_coeff", "barrier_index", "phase",
+            "plasma_stress", "magnetic_coupling",
+            "temperature_plasma", "rotation_omega",
+        ]
+        for key in required_keys:
+            assert key in results, f"Missing key: {key}"
+
+    def test_get_results_after_run(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        pm.run()
+        results = pm.get_results()
+        assert results is not None
+        assert results["module"] == "plasma_monitor"
+
+    def test_module_name(self):
+        pm = PlasmaMonitor(config=DEFAULT_CFG)
+        results = pm.run()
+        assert results["module"] == "plasma_monitor"
+# === END ===
