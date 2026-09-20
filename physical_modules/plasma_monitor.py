@@ -42,7 +42,8 @@ class PlasmaMonitor(BaseModule):
     def __init__(self, config=None, **kwargs):
         super().__init__(config)
 
-        cfg = config or {}
+        cfg = dict(config or {})
+        cfg.update(kwargs)
 
         # Геометрия
         self.radius = cfg.get("radius", 1.0e-2)
@@ -148,7 +149,7 @@ class PlasmaMonitor(BaseModule):
         sigma_0 = self.viscosity * self.flow_velocity / delta_E
 
         # Подавление магнитным полем
-        suppression = 1.0 / (1.0 + (B / self.breakdown_B) ** 2)
+        suppression = 1.0 / (1.0 + (B / self.breakdown_B) ** 4)
 
         return sigma_0 * suppression
 
