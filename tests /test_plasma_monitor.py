@@ -214,7 +214,7 @@ class TestViscousStress:
         delta_E = 1.0e-4
         B = 5.0
         sigma_0 = pm.viscosity * pm.flow_velocity / delta_E
-        suppression = 1.0 / (1.0 + (B / pm.breakdown_B) ** 2)
+        suppression = 1.0 / (1.0 + (B / pm.breakdown_B) ** 4)
         expected = sigma_0 * suppression
         assert abs(pm.compute_viscous_stress(delta_E, B) - expected) < 1e-15
 
