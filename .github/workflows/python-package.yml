@@ -44,6 +44,9 @@ jobs:
       - name: Run thermal test
         run: python run_thermal_test.py
 
+      - name: Run osmosis test
+        run: python run_osmosis_test.py
+
       - name: Run pytest
         env:
           PYTHONPATH: .
