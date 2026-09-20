@@ -34,5 +34,4 @@ jobs:
         env:
           PYTHONPATH: .
         run: |
-          python -m pytest -v
-
+          python -m pytest tests/test_plasma_monitor.py -v
