@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 GAK-WaveCAD — Coupling Monitor Test
-Тест кросс-связей между модулями.
+Тест кросс-связей между модулями (включая плазму).
 """
 
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from core.logger import get_logger
 from physical_modules.coupling_monitor import CouplingMonitor
@@ -45,6 +45,14 @@ def make_mock_results():
             'TM_l2_n1': {'f_shifted': 1.5e10, 'df_stress': 4.0e6},
             'TE_l2_n1': {'f_shifted': 1.9e10, 'df_stress': 5.0e6},
         },
+        'plasma': {
+            'sigma_viscous': 1.0e3,
+            'B_field': 2.0,
+            'diffusion_coeff': 1.0e-4,
+            'temperature_plasma': 5.0e6,
+            'barrier_index': 0.7,
+            'phase': 'STABLE',
+        },
     }
 
 
@@ -67,6 +75,7 @@ def main():
         collapse=mock['collapse'],
         magnon=mock['magnon'],
         em=mock['em'],
+        plasma=mock['plasma'],
     )
     monitor.run()
     results = monitor.get_results()
@@ -91,6 +100,7 @@ def main():
         collapse=mock['collapse'],
         magnon=mock['magnon'],
         em=mock['em'],
+        plasma=mock['plasma'],
     )
     monitor.run()
     results2 = monitor.get_results()
@@ -104,17 +114,6 @@ def main():
     print("    ✅ Тест 2: коллапс снижает stability — OK")
 
     # Тест 3: все связи ненулевые
-    monitor.set_results(
-        osmosis=mock['osmosis'],
-        thermal=mock['thermal'],
-        acoustic=mock['acoustic'],
-        collapse=mock['collapse'],
-        magnon=mock['magnon'],
-        em=mock['em'],
-    )
-    monitor.run()
-    results3 = monitor.get_results()
-    # Возвращаем STABLE
     mock['collapse']['phase'] = 'STABLE'
     mock['collapse']['ratio'] = 0.1
     monitor.set_results(
@@ -124,6 +123,7 @@ def main():
         collapse=mock['collapse'],
         magnon=mock['magnon'],
         em=mock['em'],
+        plasma=mock['plasma'],
     )
     monitor.run()
     results3 = monitor.get_results()
