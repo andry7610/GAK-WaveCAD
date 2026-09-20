@@ -44,6 +44,11 @@ jobs:
       - name: Run thermal test
         run: python run_thermal_test.py
 
+      - name: Run integration test
+        env:
+          PYTHONPATH: .
+        run: python tests/test_integration.py
+
       - name: Run pytest
         env:
           PYTHONPATH: .
