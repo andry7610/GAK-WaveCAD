@@ -86,17 +86,17 @@ class MagnonMonitor(BaseModule):
             key = f"{mtype}_l{l}"
 
             # Kittel: f = gamma_bar * B_total
-            # Exchange: f = gamma_bar * B_total + gamma_bar * mu_0 * A_ex * l*(l+1) / (M_s * R^2)
+            # Exchange: f = gamma_bar * B_total + gamma_bar * 2 * A_ex * l*(l+1) / (M_s * R^2)
             f_base = self.gamma_bar * B_total
 
             if l > 0:
-                f_exchange = self.gamma_bar * mu_0 * self.A_ex * l * (l + 1) / (self.M_s * self.R**2)
+                f_exchange = self.gamma_bar * 2 * self.A_ex * l * (l + 1) / (self.M_s * self.R**2)
                 f = f_base + f_exchange
             else:
                 f = f_base
 
-                delta_f = self.alpha_damp * 2 * f  # полная ширина (приближённо)
-
+            # Затухание Гилберта: ширина линии
+            delta_f = self.alpha_damp * 2 * f
 
             # Добротность
             Q = f / delta_f if delta_f > 0 else float('inf')
@@ -104,11 +104,7 @@ class MagnonMonitor(BaseModule):
             # Сдвиг от напряжения
             f_no_stress = self.gamma_bar * B_eff
             if l > 0:
-                f_no_stress += self.gamma_bar * mu_0 * self.A_ex * l * (l + 1) / (self.M_s * self.R**2)
-            df_stress = f - f_no_stress
-
-            if l > 0:
-                f_no_stress += self.gamma_bar * mu_0 * self.A_ex * l * (l + 1) / (self.M_s * self.R**2)
+                f_no_stress += self.gamma_bar * 2 * self.A_ex * l * (l + 1) / (self.M_s * self.R**2)
             df_stress = f - f_no_stress
 
             self.results[key] = {
