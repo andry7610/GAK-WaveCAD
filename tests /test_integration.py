@@ -121,6 +121,8 @@ def main():
 
     print("=" * 64)
 
+def test_integration():
+    main()
 
 if __name__ == "__main__":
     main()
