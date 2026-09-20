@@ -2,16 +2,18 @@
 Coupling Monitor — кросс-связи между всеми модулями системы.
 
 Модель:
-  Принимает результаты шести модулей и считает:
+  Принимает результаты семи модулей и считает:
     - магнитоупругую связь (акустика ↔ магноны)
     - пьезоэлектрическую связь (акустика ↔ EM)
     - магнитоэлектрическую связь (магноны ↔ EM)
     - тепловой сдвиг осмоса (термалка ↔ осмос)
     - влияние коллапса на геометрию (коллапс → все)
+    - плазменные кросс-связи (плазма ↔ все)
   Выдаёт общий индекс стабильности (0..1).
 
 История:
   v0.1 — базовая реализация
+  v0.2 — добавлен плазменный модуль
 """
 
 import numpy as np
@@ -39,6 +41,7 @@ class CouplingMonitor(BaseModule):
         self.collapse_results = None
         self.magnon_results = None
         self.em_results = None
+        self.plasma_results = None
 
         self.logger = get_logger("coupling_monitor")
 
@@ -48,7 +51,7 @@ class CouplingMonitor(BaseModule):
         return True
 
     def set_results(self, osmosis=None, thermal=None, acoustic=None,
-                    collapse=None, magnon=None, em=None):
+                    collapse=None, magnon=None, em=None, plasma=None):
         """Загрузить результаты от всех модулей."""
         self.osmosis_results = osmosis
         self.thermal_results = thermal
@@ -56,6 +59,7 @@ class CouplingMonitor(BaseModule):
         self.collapse_results = collapse
         self.magnon_results = magnon
         self.em_results = em
+        self.plasma_results = plasma
         self.logger.info("Результаты загружены от всех модулей")
 
     def run(self) -> bool:
@@ -65,7 +69,6 @@ class CouplingMonitor(BaseModule):
         results = {}
 
         # --- 1. Магнитоупругая связь: акустика ↔ магноны ---
-        # Насколько сильно акустическая мода сдвигает магнонные частоты
         if self.acoustic_results and self.magnon_results:
             ac_shifts = [r.get('delta_f', 0) for r in self.acoustic_results.values()]
             mag_shifts = [r.get('df_stress', 0) for r in self.magnon_results.values()]
@@ -112,7 +115,6 @@ class CouplingMonitor(BaseModule):
         if self.collapse_results:
             phase = self.collapse_results.get('phase', 'STABLE')
             ratio = self.collapse_results.get('ratio', 0.0)
-            # Геометрический фактор: 1 (устойчив) → 0 (коллапс)
             if phase == 'COLLAPSE':
                 geom_factor = 0.0
             elif phase == 'WARNING':
@@ -129,22 +131,83 @@ class CouplingMonitor(BaseModule):
             results['collapse_phase'] = 'UNKNOWN'
             results['collapse_ratio'] = 0.0
 
-        # --- 6. Общий индекс стабильности ---
-        # Взвешенная сумма всех факторов
-        stability = (
-            results['geom_factor'] * 0.30 +
-            (1.0 - min(results['k_magnetoelastic'], 1.0)) * 0.20 +
-            (1.0 - min(results['k_piezoelectric'], 1.0)) * 0.20 +
-            (1.0 - min(results['k_magnetoelectric'], 1.0)) * 0.15 +
-            (1.0 - min(results['k_thermal_osmosis'], 1.0)) * 0.15
-        )
+        # --- 6. Плазменные кросс-связи ---
+        if self.plasma_results:
+            # Плазма ↔ Акустика: вязкое напряжение сдвигает резонансные частоты
+            sigma_visc = self.plasma_results.get("sigma_viscous", 0.0)
+            acoustic = self.acoustic_results or {}
+            max_ac_stress = max(
+                (abs(r.get('delta_f', 0)) for r in acoustic.values()),
+                default=1.0
+            )
+            k_plasma_acoustic = sigma_visc / max(max_ac_stress, 1.0)
+            results['k_plasma_acoustic'] = k_plasma_acoustic
 
-        if stability > 0.7:
-            system_status = "HEALTHY"
-        elif stability > 0.4:
-            system_status = "DEGRADED"
+            # Плазма ↔ Магноны: магнитное поле плазмы сдвигает Kittel-моды
+            B_plasma = self.plasma_results.get("B_field", 0.0)
+            magnon = self.magnon_results or {}
+            B_sat = magnon.get("saturation_field", 1.0)
+            k_plasma_magnon = B_plasma / max(B_sat, 1.0)
+            results['k_plasma_magnon'] = k_plasma_magnon
+
+            # Плазма ↔ EM: диффузия влияет на добротность резонатора
+            D = self.plasma_results.get("diffusion_coeff", 0.0)
+            k_plasma_em = min(D * 1e4, 1.0)
+            results['k_plasma_em'] = k_plasma_em
+
+            # Плазма ↔ Термалка: температура плазмы — обратная связь
+            T_plasma = self.plasma_results.get("temperature_plasma", 0.0)
+            thermal = self.thermal_results or {}
+            T_thermal = thermal.get("temperature", 300.0)
+            k_plasma_thermal = (T_plasma - T_thermal) / max(T_thermal, 1.0) if T_plasma > 0 else 0.0
+            results['k_plasma_thermal'] = k_plasma_thermal
+
+            # Плазма ↔ Коллапс: барьерный индекс влияет на устойчивость оболочки
+            barrier = self.plasma_results.get("barrier_index", 0.0)
+            k_plasma_collapse = 1.0 - barrier
+            results['k_plasma_collapse'] = k_plasma_collapse
         else:
-            system_status = "CRITICAL"
+            results['k_plasma_acoustic'] = 0.0
+            results['k_plasma_magnon'] = 0.0
+            results['k_plasma_em'] = 0.0
+            results['k_plasma_thermal'] = 0.0
+            results['k_plasma_collapse'] = 0.0
+
+        # --- 7. Общий индекс стабильности ---
+        stability = (
+            results['geom_factor'] * 0.25 +
+            (1.0 - min(results['k_magnetoelastic'], 1.0)) * 0.15 +
+            (1.0 - min(results['k_piezoelectric'], 1.0)) * 0.15 +
+            (1.0 - min(results['k_magnetoelectric'], 1.0)) * 0.10 +
+            (1.0 - min(results['k_thermal_osmosis'], 1.0)) * 0.10 +
+            (1.0 - min(results['k_plasma_acoustic'], 1.0)) * 0.05 +
+            (1.0 - min(results['k_plasma_magnon'], 1.0)) * 0.05 +
+            (1.0 - min(results['k_plasma_collapse'], 1.0)) * 0.05 +
+            (1.0 - min(results['k_plasma_em'], 1.0)) * 0.05 +
+            (1.0 - min(results['k_plasma_thermal'], 1.0)) * 0.05
+        )
+        stability = max(0.0, min(1.0, stability))
+
+        # Фаза плазмы влияет на системный статус
+        if self.plasma_results:
+            plasma_phase = self.plasma_results.get("phase", "STABLE")
+            if plasma_phase == "BREAKDOWN":
+                system_status = "CRITICAL"
+            elif plasma_phase == "CONTACT":
+                system_status = "CRITICAL"
+            elif stability > 0.7:
+                system_status = "HEALTHY"
+            elif stability > 0.4:
+                system_status = "DEGRADED"
+            else:
+                system_status = "CRITICAL"
+        else:
+            if stability > 0.7:
+                system_status = "HEALTHY"
+            elif stability > 0.4:
+                system_status = "DEGRADED"
+            else:
+                system_status = "CRITICAL"
 
         results['stability_index'] = stability
         results['system_status'] = system_status
@@ -162,6 +225,11 @@ class CouplingMonitor(BaseModule):
         print(f"    k_piezoelectric   : {self.results['k_piezoelectric']:.4e}")
         print(f"    k_magnetoelectric : {self.results['k_magnetoelectric']:.4e}")
         print(f"    k_thermal_osmosis : {self.results['k_thermal_osmosis']:.4f}")
+        print(f"    k_plasma_acoustic : {self.results['k_plasma_acoustic']:.4e}")
+        print(f"    k_plasma_magnon   : {self.results['k_plasma_magnon']:.4e}")
+        print(f"    k_plasma_em       : {self.results['k_plasma_em']:.4e}")
+        print(f"    k_plasma_thermal  : {self.results['k_plasma_thermal']:.4e}")
+        print(f"    k_plasma_collapse : {self.results['k_plasma_collapse']:.4e}")
         print(f"    geom_factor       : {self.results['geom_factor']:.3f}")
         print(f"    collapse_phase    : {self.results['collapse_phase']}")
         print(f"    stability_index   : {self.results['stability_index']:.3f}")
