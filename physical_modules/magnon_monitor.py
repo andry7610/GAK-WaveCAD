@@ -107,6 +107,10 @@ class MagnonMonitor(BaseModule):
                 f_no_stress += self.gamma_bar * mu_0 * self.A_ex * l * (l + 1) / (self.M_s * self.R**2)
             df_stress = f - f_no_stress
 
+            if l > 0:
+                f_no_stress += self.gamma_bar * mu_0 * self.A_ex * l * (l + 1) / (self.M_s * self.R**2)
+            df_stress = f - f_no_stress
+
             self.results[key] = {
                 'l': l,
                 'mtype': mtype,
