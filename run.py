@@ -3,9 +3,10 @@ GAK-WaveCAD — главная точка запуска.
 
 Загружает конфигурацию, инициализирует модули,
 запускает цепочку:
-  осмос → термалка → акустика → коллапс → магноны → EM → плазма → кросс-связи.
+  осмос → термалка → акустика → коллапс → магноны → EM → плазма → вакуум → кросс-связи.
 
-v0.3 — добавлен плазма-монитор с циклом step(dt).
+v0.4 — добавлен VacuumMonitor (8-й модуль) после плазмы.
+       step(dt) в цикле для плазмы и вакуума.
 """
 
 import os
@@ -22,6 +23,7 @@ from physical_modules.born_collapse_monitor import BornCollapseMonitor
 from physical_modules.magnon_monitor import MagnonMonitor
 from physical_modules.em_resonance_monitor import EMResonanceMonitor
 from physical_modules.plasma_monitor import PlasmaMonitor
+from physical_modules.vacuum_monitor import VacuumMonitor
 from physical_modules.coupling_monitor import CouplingMonitor
 
 
@@ -31,8 +33,6 @@ def main():
     config_path = os.path.join(os.path.dirname(__file__), "configs", "config.yaml")
     config = ConfigLoader.load(config_path)
     logger.info("Конфигурация загружена")
-
-    # --- Статические модули (один прогон) ---
 
     # Модуль 1: осмос
     osm_cfg = config.get("osmosis_monitor", {})
@@ -93,47 +93,48 @@ def main():
     em.run()
     em.print_report()
 
-    # --- Плазма (динамический модуль — цикл step(dt)) ---
+    # --- Параметры симуляции ---
+    sim_cfg = config.get("simulation", {})
+    N_STEPS = sim_cfg.get("n_steps", 100)
+    dt = sim_cfg.get("dt", 0.001)
 
     # Модуль 7: плазма
-    plasma_cfg = config.get("plasma_monitor", {})
-    plasma = PlasmaMonitor(plasma_cfg)
+    pl_cfg = config.get("plasma_monitor", {})
+    plasma = PlasmaMonitor(pl_cfg)
     plasma.init()
+    plasma.run()  # Первый прогон — инициализация
 
-    # Внешние напряжения для плазмы
-    acoustic_shift = 0.0
-    if ac_results:
-        shifts = [r.get("delta_f", 0) for r in ac_results.values()]
-        acoustic_shift = sum(shifts) / len(shifts) if shifts else 0.0
+    # Модуль 8: вакуум (после плазмы)
+    vac_cfg = config.get("vacuum_monitor", {})
+    vacuum = VacuumMonitor(vac_cfg)
+    vacuum.init()
+    vacuum.run(external={})  # Первый прогон
 
-    plasma_external_stress = {
-        "sigma_thermal": th_stress,
-        "sigma_osmotic": osm_stress,
-        "acoustic_freq_shift": acoustic_shift,
-    }
+    # --- Цикл эволюции: плазма + вакуум ---
+    for step_i in range(N_STEPS):
+        # Плазма делает шаг
+        plasma.step(dt)
+        plasma.run()
 
-    # Первый прогон — начальное состояние
-    plasma.run(external_stress=plasma_external_stress)
+        # Вакуум делает шаг: откачка с учётом давления плазмы
+        pl_results = plasma.get_results()
+        T_plasma = pl_results.get("temperature_plasma", 0.0)
+        n_gas = pl_results.get("density", 0.0) * 1e-6  # Часть плотности — нейтральный газ
+        vacuum.step(dt, Q_in=0.0, S_pump=vacuum.pump_speed)
+        vacuum.run(external={})
+
+        vac_results = vacuum.get_results()
+        P_gas = vac_results.get("pressure", 0.0)
+
+        if step_i == 0 or step_i == N_STEPS - 1 or (step_i + 1) % 10 == 0:
+            logger.info(f"  Шаг {step_i + 1}/{N_STEPS}: "
+                        f"T_plasma={T_plasma:.2e} К, "
+                        f"P_gas={P_gas:.2e} Па")
+
     plasma.print_report()
+    vacuum.print_report()
 
-    # Цикл временной динамики
-    N_STEPS = config.get("simulation", {}).get("n_steps", 100)
-    DT = config.get("simulation", {}).get("dt", 1e-3)
-
-    logger.info(f"Цикл плазмы: {N_STEPS} шагов, dt={DT} с")
-
-    for step in range(N_STEPS):
-        plasma.step(DT)
-        # Обновляем результаты плазмы после каждого шага
-        plasma.run(external_stress=plasma_external_stress)
-
-    plasma.print_report()
-    logger.info(f"После {N_STEPS} шагов: T={plasma.temperature:.3e} К, "
-                f"lawson={plasma.check_lawson()}")
-
-    # --- Кросс-связи (после эволюции плазмы) ---
-
-    # Модуль 8: coupling
+    # Модуль 9: кросс-связи (восемь модулей)
     coupling = CouplingMonitor()
     coupling.init()
     coupling.set_results(
@@ -144,12 +145,13 @@ def main():
         magnon=magnon.get_results(),
         em=em.get_results(),
         plasma=plasma.get_results(),
+        vacuum=vacuum.get_results(),
     )
     coupling.run()
     coupling.print_report()
 
     logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс → "
-                "магноны → EM → плазма → кросс-связи")
+                "магноны → EM → плазма → вакуум → кросс-связи")
 
 
 if __name__ == "__main__":
