@@ -2,19 +2,21 @@
 Coupling Monitor — кросс-связи между всеми модулями системы.
 
 Модель:
-  Принимает результаты семи модулей и считает:
+  Принимает результаты восьми модулей и считает:
     - магнитоупругую связь (акустика ↔ магноны)
     - пьезоэлектрическую связь (акустика ↔ EM)
     - магнитоэлектрическую связь (магноны ↔ EM)
     - тепловой сдвиг осмоса (термалка ↔ осмос)
     - влияние коллапса на геометрию (коллапс → все)
     - плазменные кросс-связи (плазма ↔ все)
+    - вакуумные кросс-связи (плазма ↔ вакуум)
   Выдаёт общий индекс стабильности (0..1).
 
 История:
   v0.1 — базовая реализация
   v0.2 — добавлен плазменный модуль
   v0.3 — подхват Лоусона, dE_dt, tau_E из плазмы v0.2
+  v0.4 — вакуум: k_plasma_vacuum, P_gas → плазма
 """
 
 import numpy as np
@@ -43,6 +45,7 @@ class CouplingMonitor(BaseModule):
         self.magnon_results = None
         self.em_results = None
         self.plasma_results = None
+        self.vacuum_results = None
 
         self.logger = get_logger("coupling_monitor")
 
@@ -52,7 +55,8 @@ class CouplingMonitor(BaseModule):
         return True
 
     def set_results(self, osmosis=None, thermal=None, acoustic=None,
-                    collapse=None, magnon=None, em=None, plasma=None):
+                    collapse=None, magnon=None, em=None, plasma=None,
+                    vacuum=None):
         """Загрузить результаты от всех модулей."""
         self.osmosis_results = osmosis
         self.thermal_results = thermal
@@ -61,6 +65,7 @@ class CouplingMonitor(BaseModule):
         self.magnon_results = magnon
         self.em_results = em
         self.plasma_results = plasma
+        self.vacuum_results = vacuum
         self.logger.info("Результаты загружены от всех модулей")
 
     def run(self) -> bool:
@@ -179,7 +184,25 @@ class CouplingMonitor(BaseModule):
             results['k_plasma_thermal'] = 0.0
             results['k_plasma_collapse'] = 0.0
 
-        # --- 7. Общий индекс стабильности ---
+        # --- 7. Вакуумные кросс-связи: плазма ↔ вакуум ---
+        if self.plasma_results and self.vacuum_results:
+            # Газовое давление из вакуума охлаждает плазму
+            P_gas = self.vacuum_results.get("pressure", 0.0)
+            T_plasma = self.plasma_results.get("temperature_plasma", 0.0)
+            # Нормировка: 1 Па — умеренное давление для плазменной камеры
+            k_plasma_vacuum = min(P_gas / 1.0, 1.0) if P_gas > 0 else 0.0
+            results['k_plasma_vacuum'] = k_plasma_vacuum
+            results['P_gas'] = P_gas
+
+            # Вакуум ↔ Термалка: отвод тепла через газ
+            pump_speed = self.vacuum_results.get("pump_speed", 0.0)
+            results['k_vacuum_thermal'] = min(pump_speed * 1e3, 1.0)
+        else:
+            results['k_plasma_vacuum'] = 0.0
+            results['P_gas'] = 0.0
+            results['k_vacuum_thermal'] = 0.0
+
+        # --- 8. Общий индекс стабильности ---
         stability = (
             results['geom_factor'] * 0.25 +
             (1.0 - min(results['k_magnetoelastic'], 1.0)) * 0.15 +
@@ -190,7 +213,8 @@ class CouplingMonitor(BaseModule):
             (1.0 - min(results['k_plasma_magnon'], 1.0)) * 0.05 +
             (1.0 - min(results['k_plasma_collapse'], 1.0)) * 0.05 +
             (1.0 - min(results['k_plasma_em'], 1.0)) * 0.05 +
-            (1.0 - min(results['k_plasma_thermal'], 1.0)) * 0.05
+            (1.0 - min(results['k_plasma_thermal'], 1.0)) * 0.05 +
+            (1.0 - min(results['k_plasma_vacuum'], 1.0)) * 0.05
         )
         stability = max(0.0, min(1.0, stability))
 
@@ -253,6 +277,8 @@ class CouplingMonitor(BaseModule):
         print(f"    k_plasma_em       : {self.results['k_plasma_em']:.4e}")
         print(f"    k_plasma_thermal  : {self.results['k_plasma_thermal']:.4e}")
         print(f"    k_plasma_collapse : {self.results['k_plasma_collapse']:.4e}")
+        print(f"    k_plasma_vacuum   : {self.results['k_plasma_vacuum']:.4e}")
+        print(f"    P_gas             : {self.results['P_gas']:.4e} Па")
         print(f"    geom_factor       : {self.results['geom_factor']:.3f}")
         print(f"    collapse_phase    : {self.results['collapse_phase']}")
         print(f"    stability_index   : {self.results['stability_index']:.3f}")
