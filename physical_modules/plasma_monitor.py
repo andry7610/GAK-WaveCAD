@@ -12,6 +12,7 @@ Plasma Monitor — модуль плазменной оболочки.
   Принимает внешние напряжения от осмоса, термалки, акустики.
 
 История:
+  v0.2 — критерий Лоусона, энергобаланс, временная динамика (step)
   v0.1 — базовая реализация
 """
 
@@ -22,7 +23,7 @@ from core.module_registry import ModuleRegistry
 from core.logger import get_logger
 
 
-# --- Константы ---
+# --- Физические константы ---
 MU_0 = 4 * np.pi * 1e-7       # магнитная проницаемость вакуума, Гн/м
 K_B = 1.380649e-23            # постоянная Больцмана, Дж/К
 E_CHARGE = 1.602176634e-19    # элементарный заряд, Кл
@@ -33,6 +34,25 @@ FUEL_MASSES = {
     "D-T":   [3.34e-27, 5.01e-27],   # дейтерий, тритий
     "D-D":   [3.34e-27, 3.34e-27],   # дейтерий, дейтерий
 }
+
+# --- Пороги Лоусона: n * T_keV * tau_E [кэВ·с/м³] ---
+LAWSON_THRESHOLDS = {
+    "D-T":   3.0e21,
+    "D-D":   1.0e24,
+    "D-He3": 1.0e22,
+    "custom": 3.0e21,
+}
+
+# --- Энергия на реакцию [Дж] ---
+FUEL_ENERGY = {
+    "D-T":   17.6e6 * E_CHARGE,   # 17.6 МэВ
+    "D-D":   3.65e6 * E_CHARGE,    # 3.65 МэВ (среднее по ветвям)
+    "D-He3": 18.3e6 * E_CHARGE,   # 18.3 МэВ
+    "custom": 17.6e6 * E_CHARGE,
+}
+
+# --- Коэффициент gyro-Bohm для tau_E ---
+C_GYRO_BOHM = 0.14
 
 
 @ModuleRegistry.register("plasma_monitor")
@@ -80,6 +100,10 @@ class PlasmaMonitor(BaseModule):
 
         # Пересчёт массы иона по топливному пресету
         self._apply_fuel_preset()
+
+        # Временная динамика (v0.2)
+        self.sim_time = 0.0
+        self.last_balance = None
 
         self.logger = get_logger("plasma_monitor")
         self.results = None
@@ -290,3 +314,183 @@ class PlasmaMonitor(BaseModule):
 
     def get_results(self) -> dict:
         return self.results
+
+    # === Плазма v0.2: Лоусон, энергобаланс, динамика ===
+
+    def _T_to_keV(self) -> float:
+        """Перевод температуры из Кельвина в кэВ."""
+        return self.temperature * K_B / (E_CHARGE * 1e3)
+
+    def compute_tau_E(self) -> float:
+        """Время удержания энергии (gyro-Bohm).
+
+        tau_E = C_gB * a² * B² / (sqrt(T_keV) * n_20)
+
+        где n_20 = n / 1e20 (в единицах 10^20 м⁻³),
+        T_keV — температура в кэВ,
+        B — полное магнитное поле (Тл),
+        a — радиус плазмы (м).
+
+        Возвращает время в секундах.
+        """
+        T_keV = self._T_to_keV()
+        if T_keV <= 0:
+            return 0.0
+
+        n_20 = self.density_number / 1e20
+        if n_20 <= 0:
+            return 0.0
+
+        # Полное магнитное поле
+        B = self.compute_magnetic_field()
+        B_z = self._compute_z_pinch_field()
+        if B_z > 0:
+            B = np.sqrt(B**2 + B_z**2)
+
+        if B <= 0:
+            return 0.0
+
+        tau_E = C_GYRO_BOHM * self.radius**2 * B**2 / (np.sqrt(T_keV) * n_20)
+        return float(tau_E)
+
+    def compute_reactivity(self) -> float:
+        """Реактивность <σv>(T) — Bosch-Hale / NRL аппроксимация.
+
+        Возвращает <σv> в м³/с для заданного топлива и температуры.
+
+        D-T:   3.68e-18 * T^(-2/3) * exp(-19.94 * T^(-1/3))
+        D-D:   3.70e-18 * T^(-2/3) * exp(-46.10 * T^(-1/3))
+        D-He3: 5.50e-18 * T^(-2/3) * exp(-38.40 * T^(-1/3))
+        """
+        T_keV = self._T_to_keV()
+        if T_keV <= 0:
+            return 0.0
+
+        T_pow = T_keV ** (-2.0 / 3.0)
+
+        if self.fuel_type == "D-T":
+            sv = 3.68e-18 * T_pow * np.exp(-19.94 * T_keV ** (-1.0 / 3.0))
+        elif self.fuel_type == "D-D":
+            sv = 3.70e-18 * T_pow * np.exp(-46.10 * T_keV ** (-1.0 / 3.0))
+        elif self.fuel_type == "D-He3":
+            sv = 5.50e-18 * T_pow * np.exp(-38.40 * T_keV ** (-1.0 / 3.0))
+        else:
+            # custom — по умолчанию D-T
+            sv = 3.68e-18 * T_pow * np.exp(-19.94 * T_keV ** (-1.0 / 3.0))
+
+        return float(sv)
+
+    def compute_energy_balance(self) -> dict:
+        """Энергобаланс плазмы: P_fusion vs P_rad + P_cond.
+
+        P_fusion — термоядерная мощность (Вт/м³)
+        P_rad    — тормозное излучение Bremsstrahlung (Вт/м³)
+        P_cond   — потери на теплопроводность (Вт/м³)
+        dE_dt    — чистый приток энергии (Вт/м³)
+
+        P_fusion = (n²/4) * <σv> * E_fus    (D-T, D-He3)
+        P_fusion = (n²/2) * <σv> * E_fus    (D-D, одинаковые частицы)
+        P_rad    = 1.69e-38 * Z_eff * n² * sqrt(T_keV)
+        P_cond   = 3 * n * k_B * T / tau_E
+        """
+        T_keV = self._T_to_keV()
+        n = self.density_number
+        sv = self.compute_reactivity()
+        E_fus = FUEL_ENERGY.get(self.fuel_type, 17.6e6 * E_CHARGE)
+
+        # --- Термоядерная мощность ---
+        if self.fuel_type == "D-D":
+            # Одинаковые частицы: n_D = n, фактор 1/2
+            P_fusion = 0.5 * n**2 * sv * E_fus
+        else:
+            # D-T, D-He3: n_D = n_T = n/2
+            P_fusion = 0.25 * n**2 * sv * E_fus
+
+        # --- Тормозное излучение (Bremsstrahlung) ---
+        Z_eff = 1.0  # Для чистого топлива Z_eff ≈ 1
+        P_rad = 1.69e-38 * Z_eff * n**2 * np.sqrt(max(T_keV, 0.0))
+
+        # --- Потери на теплопроводность ---
+        tau_E = self.compute_tau_E()
+        if tau_E > 0:
+            P_cond = 3.0 * n * K_B * self.temperature / tau_E
+        else:
+            P_cond = float('inf')
+
+        # --- Чистый баланс ---
+        dE_dt = P_fusion - P_rad - P_cond
+
+        result = {
+            "P_fusion": float(P_fusion),
+            "P_rad": float(P_rad),
+            "P_cond": float(P_cond),
+            "dE_dt": float(dE_dt),
+            "tau_E": float(tau_E),
+            "T_keV": float(T_keV),
+            "reactivity": float(sv),
+        }
+
+        self.last_balance = result
+        return result
+
+    def check_lawson(self) -> bool:
+        """Критерий Лоусона: n * T_keV * tau_E >= threshold?
+
+        Пороги:
+            D-T:   3 × 10²¹ кэВ·с/м³
+            D-D:   1 × 10²⁴ кэВ·с/м³
+            D-He3: 1 × 10²² кэВ·с/м³
+
+        Возвращает True, если зажигание возможно.
+        """
+        threshold = LAWSON_THRESHOLDS.get(self.fuel_type, 3.0e21)
+
+        T_keV = self._T_to_keV()
+        tau_E = self.compute_tau_E()
+
+        product = self.density_number * T_keV * tau_E
+        return product >= threshold
+
+    def step(self, dt: float) -> dict:
+        """Один шаг временной динамики.
+
+        dT/dt = (P_fusion - P_rad - P_cond) / (3/2 * n * k_B)
+
+        Обновляет self.temperature и self.sim_time.
+        Возвращает словарь с состоянием после шага.
+        """
+        balance = self.compute_energy_balance()
+        n = self.density_number
+        dE_dt = balance["dE_dt"]
+
+        # Изменение температуры
+        if n > 0:
+            dT = dE_dt * dt / (1.5 * n * K_B)
+        else:
+            dT = 0.0
+
+        self.temperature += dT
+
+        # Защита от нефизичных значений
+        if np.isnan(self.temperature):
+            self.temperature = 0.0
+        if self.temperature < 0:
+            self.temperature = 0.0
+        if self.temperature > 1e12:
+            self.temperature = 1e12
+
+        self.sim_time += dt
+
+        result = {
+            "temperature": float(self.temperature),
+            "T_keV": float(self._T_to_keV()),
+            "dE_dt": float(dE_dt),
+            "P_fusion": balance["P_fusion"],
+            "P_rad": balance["P_rad"],
+            "P_cond": balance["P_cond"],
+            "tau_E": balance["tau_E"],
+            "sim_time": float(self.sim_time),
+            "lawson_ignited": self.check_lawson(),
+        }
+
+        return result
