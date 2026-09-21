@@ -7,8 +7,7 @@ tests/test_step.py — Временная динамика плазмы (step())
 import numpy as np
 import pytest
 
-from plasma_monitor import PlasmaMonitor
-
+from physical_modules.plasma_monitor import PlasmaMonitor
 
 def _make_plasma(**overrides):
     cfg = {
