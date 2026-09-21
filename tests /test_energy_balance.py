@@ -84,7 +84,7 @@ def test_steady_state_balance():
     assert balance["P_cond"] >= 0, "P_cond должно быть неотрицательным"
 
     # Проверка аддитивности
-    expected_dE = balance["P_fusion"] - balance["P_radiation"] - balance["P_conduction"]
+    expected_dE = balance["P_fusion"] - balance["P_rad"] - balance["P_cond"]
     assert np.isclose(balance["dE_dt"], expected_dE, rtol=1e-10), (
         f"dE_dt = {balance['dE_dt']:.3e}, "
         f"P_fus - P_rad - P_cond = {expected_dE:.3e}"
