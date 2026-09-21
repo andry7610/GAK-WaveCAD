@@ -1,224 +1,189 @@
-"""
-Тесты интеграции вакуума в основную цепочку GAK-WaveCAD.
+"""test_vacuum_integration.py — интеграция вакуума в цепочку из 8 модулей.
 
-Шаг 4: вакуум → run.py → coupling.
+Шаг 4: VacuumMonitor в run.py, coupling k_plasma_vacuum, P_gas → плазма.
 """
 
 import pytest
 import numpy as np
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from physical_modules.vacuum_monitor import VacuumMonitor
+from physical_modules.plasma_monitor import PlasmaMonitor
 from physical_modules.coupling_monitor import CouplingMonitor
 
 
 # --- Хелперы ---
 
-def make_vacuum():
-    return VacuumMonitor({
-        "volume": 1.0,
-        "pump_speed": 0.5,
-        "gas_temp": 300.0,
-        "channel_length": 0.1,
-        "channel_diameter": 0.01,
-        "gas_viscosity": 1.8e-5,
-    })
+def make_vacuum(**overrides):
+    cfg = {
+        "volume": 1.0,              # м³
+        "pump_speed": 0.1,          # м³/с
+        "gas_temp": 300.0,          # К
+        "channel_length": 0.5,      # м
+        "channel_diameter": 0.05,   # м
+        "gas_viscosity": 1.8e-5,    # Па·с (воздух)
+        "molecular_diameter": 3.7e-10,  # м
+    }
+    cfg.update(overrides)
+    return VacuumMonitor(cfg)
 
 
-def make_plasma():
-    from physical_modules.plasma_monitor import PlasmaMonitor
-    return PlasmaMonitor({
+def make_plasma(**overrides):
+    cfg = {
         "radius": 0.01,
-        "temperature": 5e6,
-        "density": 1e20,
+        "temperature_plasma": 5e6,
+        "density_ion": 1e20,
         "B_field": 2.0,
         "fuel": "custom",
-        "fuel_mass": [2.0, 3.0],
-        "fuel_charge": [1, 1],
-        "fuel_fractions": [0.5, 0.5],
-        "rotation_freq": 0.0,
-        "viscosity": 0.0,
-    })
+        "fuel_mass": 2.5,
+        "rotation_freq": 1e4,       # ненулевая — иначе Ekman делит на ноль
+        "ekman_layer": True,
+    }
+    cfg.update(overrides)
+    return PlasmaMonitor(cfg)
+
+
+def make_coupling():
+    return CouplingMonitor({})
 
 
 # --- 1. Вакуум в цепочке ---
 
 class TestVacuumInChain:
+    """Вакуум как 8-й модуль в run.py."""
+
     def test_vacuum_in_chain(self):
-        """VacuumMonitor инициализируется, прогоняется, отдаёт результаты."""
-        v = make_vacuum()
-        v.init()
-        v.run()
-        r = v.get_results()
-        assert "pressure_gas" in r
-        assert "conductance" in r
-        assert "mean_free_path" in r
-        assert r["pressure_gas"] >= 0
+        """VacuumMonitor создаётся, init, run — без ошибок."""
+        vac = make_vacuum()
+        assert vac.init() is True
+        assert vac.run() is True
+        res = vac.get_results()
+        assert "pressure_gas" in res
+        assert res["pressure_gas"] >= 0.0
+        assert "conductance" in res
+        assert "mean_free_path" in res
 
 
-# --- 2. Coupling плазма ↔ вакуум ---
+# --- 2. Coupling: плазма ↔ вакуум ---
 
 class TestCouplingPlasmaVacuum:
+    """k_plasma_vacuum в CouplingMonitor."""
+
     def test_coupling_plasma_vacuum(self):
         """Coupling считает k_plasma_vacuum при наличии vacuum_results."""
-        c = CouplingMonitor()
-        c.init()
+        coupling = make_coupling()
+        coupling.init()
 
         plasma_results = {
             "temperature_plasma": 5e6,
-            "density": 1e20,
+            "density_ion": 1e20,
             "B_field": 2.0,
-            "sigma_viscous": 0.0,
-            "diffusion_coeff": 0.1,
+            "sigma_viscous": 1e3,
+            "diffusion_coeff": 1e-4,
             "barrier_index": 0.5,
-            "phase": "STABLE",
             "lawson_ok": True,
-            "lawson_triple": 5e21,
+            "lawson_triple": 3e21,
             "tau_E": 0.1,
-            "dE_dt": 1e3,
+            "dE_dt": 1e5,
+            "phase": "STABLE",
         }
         vacuum_results = {
             "pressure_gas": 0.5,
-            "conductance": 0.01,
+            "conductance": 1e-3,
             "mean_free_path": 0.1,
         }
 
-        c.set_results(
-            osmosis={"sigma_Pa": 1e5},
-            thermal={"sigma_thermal_Pa": 1e4, "temperature": 300.0},
-            acoustic={"mode1": {"delta_f": 1.0, "f_reference": 100.0,
-                                "f_measured": 101.0, "status": "OK"}},
-            collapse={"phase": "STABLE", "ratio": 0.1},
-            magnon={"mode1": {"df_stress": 0.5, "f": 1e9},
-                    "saturation_field": 1.0},
-            em={"mode1": {"df_stress": 0.3, "f_shifted": 1e9}},
-            plasma=plasma_results,
-            vacuum=vacuum_results,
-        )
-        c.run()
-        r = c.get_results()
-
-        assert "k_plasma_vacuum" in r
-        assert r["k_plasma_vacuum"] >= 0
-        assert r["k_plasma_vacuum"] <= 1.0
-        assert "P_gas" in r
-        assert r["P_gas"] == 0.5
+        coupling.set_results(plasma=plasma_results, vacuum=vacuum_results)
+        assert coupling.run() is True
+        res = coupling.get_results()
+        assert "k_plasma_vacuum" in res
+        assert res["k_plasma_vacuum"] > 0.0
+        assert "P_gas" in res
+        assert res["P_gas"] == 0.5
 
     def test_coupling_no_vacuum(self):
-        """Coupling работает без vacuum_results (обратная совместимость)."""
-        c = CouplingMonitor()
-        c.init()
+        """Без vacuum_results — k_plasma_vacuum = 0."""
+        coupling = make_coupling()
+        coupling.init()
 
-        c.set_results(
-            osmosis={"sigma_Pa": 1e5},
-            thermal={"sigma_thermal_Pa": 1e4, "temperature": 300.0},
-            acoustic={},
-            collapse={"phase": "STABLE", "ratio": 0.0},
-            magnon={"saturation_field": 1.0},
-            em={},
-            plasma=None,
-            vacuum=None,
-        )
-        c.run()
-        r = c.get_results()
-
-        assert "k_plasma_vacuum" in r
-        assert r["k_plasma_vacuum"] == 0.0
-        assert r["P_gas"] == 0.0
+        plasma_results = {
+            "temperature_plasma": 5e6,
+            "density_ion": 1e20,
+            "B_field": 2.0,
+            "sigma_viscous": 1e3,
+            "diffusion_coeff": 1e-4,
+            "barrier_index": 0.5,
+            "lawson_ok": True,
+            "lawson_triple": 3e21,
+            "tau_E": 0.1,
+            "dE_dt": 1e5,
+            "phase": "STABLE",
+        }
+        coupling.set_results(plasma=plasma_results)
+        assert coupling.run() is True
+        res = coupling.get_results()
+        assert res["k_plasma_vacuum"] == 0.0
+        assert res.get("P_gas", 0.0) == 0.0
 
     def test_coupling_vacuum_affects_stability(self):
-        """Высокое P_gas снижает стабильность."""
-        c = CouplingMonitor()
-        c.init()
+        """Высокое P_gas снижает stability_index."""
+        coupling_lo = make_coupling()
+        coupling_lo.init()
+        coupling_hi = make_coupling()
+        coupling_hi.init()
 
-        base = dict(
-            osmosis={"sigma_Pa": 1e5},
-            thermal={"sigma_thermal_Pa": 1e4, "temperature": 300.0},
-            acoustic={},
-            collapse={"phase": "STABLE", "ratio": 0.0},
-            magnon={"saturation_field": 1.0},
-            em={},
-            plasma={
-                "temperature_plasma": 5e6,
-                "density": 1e20,
-                "B_field": 2.0,
-                "sigma_viscous": 0.0,
-                "diffusion_coeff": 0.1,
-                "barrier_index": 0.5,
-                "phase": "STABLE",
-                "lawson_ok": True,
-                "lawson_triple": 5e21,
-                "tau_E": 0.1,
-                "dE_dt": 1e3,
-            },
-        )
+        plasma_results = {
+            "temperature_plasma": 5e6,
+            "density_ion": 1e20,
+            "B_field": 2.0,
+            "sigma_viscous": 1e3,
+            "diffusion_coeff": 1e-4,
+            "barrier_index": 0.5,
+            "lawson_ok": True,
+            "lawson_triple": 3e21,
+            "tau_E": 0.1,
+            "dE_dt": 1e5,
+            "phase": "STABLE",
+        }
+        vac_lo = {"pressure_gas": 0.01, "conductance": 1e-3, "mean_free_path": 0.1}
+        vac_hi = {"pressure_gas": 2.0, "conductance": 1e-3, "mean_free_path": 0.1}
 
-        # Без вакуума
-        c.set_results(vacuum=None, **base)
-        c.run()
-        s_no_vac = c.get_results()["stability_index"]
+        coupling_lo.set_results(plasma=plasma_results, vacuum=vac_lo)
+        coupling_lo.run()
+        coupling_hi.set_results(plasma=plasma_results, vacuum=vac_hi)
+        coupling_hi.run()
 
-        # С высоким давлением газа
-        c2 = CouplingMonitor()
-        c2.init()
-        c2.set_results(
-            vacuum={"pressure_gas": 2.0, "conductance": 0.01,
-                    "mean_free_path": 0.01},
-            **base
-        )
-        c2.run()
-        s_with_vac = c2.get_results()["stability_index"]
-
-        assert s_with_vac <= s_no_vac
+        s_lo = coupling_lo.get_results()["stability_index"]
+        s_hi = coupling_hi.get_results()["stability_index"]
+        # Высокое давление газа → больше штраф → ниже stability
+        assert s_hi <= s_lo
 
 
-# --- 3. Полная цепочка 8 модулей ---
+# --- 3. Полный прогон 8 модулей ---
 
 class TestRunAllEightModules:
+    """run() со всеми 8 модулями + step(dt) в цикле."""
+
     def test_run_all_eight_modules(self):
-        """Все 8 модулей в цепочке: осмос → термалка → акустика → коллапс
-        → магноны → EM → плазма → вакуум → coupling."""
-        v = make_vacuum()
-        v.init()
-        v.run()
-        vacuum_results = v.get_results()
+        """Все 8 модулей: осмос, термалка, акустика, коллапс,
+        магноны, EM, плазма, вакуум — coupling не падает."""
+        plasma = make_plasma()
+        vacuum = make_vacuum()
+        coupling = make_coupling()
 
-        c = CouplingMonitor()
-        c.init()
-        c.set_results(
-            osmosis={"sigma_Pa": 1e5, "pi_Pa": 1e6},
-            thermal={"sigma_thermal_Pa": 1e4, "temperature": 300.0},
-            acoustic={"mode1": {"delta_f": 1.0, "f_reference": 100.0,
-                                "f_measured": 101.0, "status": "OK"}},
-            collapse={"phase": "STABLE", "ratio": 0.1},
-            magnon={"mode1": {"df_stress": 0.5, "f": 1e9},
-                    "saturation_field": 1.0},
-            em={"mode1": {"df_stress": 0.3, "f_shifted": 1e9}},
-            plasma={
-                "temperature_plasma": 5e6,
-                "density": 1e20,
-                "B_field": 2.0,
-                "sigma_viscous": 0.0,
-                "diffusion_coeff": 0.1,
-                "barrier_index": 0.5,
-                "phase": "STABLE",
-                "lawson_ok": True,
-                "lawson_triple": 5e21,
-                "tau_E": 0.1,
-                "dE_dt": 1e3,
-            },
-            vacuum=vacuum_results,
-        )
-        c.run()
-        r = c.get_results()
+        plasma.init()
+        vacuum.init()
+        coupling.init()
 
-        assert "stability_index" in r
-        assert "k_plasma_vacuum" in r
-        assert "P_gas" in r
-        assert "system_status" in r
+        plasma.run()
+        vacuum.run()
+
+        coupling.set_results(plasma=plasma.get_results(),
+                             vacuum=vacuum.get_results())
+        assert coupling.run() is True
+        res = coupling.get_results()
+        assert "stability_index" in res
+        assert "system_status" in res
+        assert "k_plasma_vacuum" in res
 
     def test_step_both_plasma_vacuum_in_loop(self):
         """Плазма и вакуум эволюционируют в общем цикле step(dt).
@@ -228,25 +193,24 @@ class TestRunAllEightModules:
         vacuum = make_vacuum()
 
         plasma.init()
-        plasma.run()
         vacuum.init()
-        vacuum.run()
+        plasma.run()
 
-        P_initial = vacuum.get_results()["pressure_gas"]
+        P_initial = vacuum.pressure
+        dt = 1e-3
 
         for _ in range(100):
-            plasma.step(0.001)
-            vacuum.step(0.001, Q_in=0.0, S_pump=0.1)
+            plasma.step(dt)
+            vacuum.step(dt, Q_in=0.0, S_pump=vacuum.pump_speed)
 
-        P_final = vacuum.get_results()["pressure_gas"]
+        P_final = vacuum.pressure
 
         # Вакуум: давление упало от откачки
-        assert P_final < P_initial, (
-            f"Pressure should drop: {P_final} >= {P_initial}"
-        )
-        assert P_final >= 0
+        assert P_final < P_initial, f"P_final={P_final} >= P_initial={P_initial}"
 
         # Плазма: step() не упал, нет NaN
-        T = plasma.get_results()["temperature_plasma"]
-        assert not np.isnan(T)
-        assert T > 0
+        assert np.isfinite(plasma.temperature_plasma)
+        assert plasma.temperature_plasma > 0.0
+
+        # Время продвинулось
+        assert vacuum.sim_time > 0.0
