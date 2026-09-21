@@ -15,7 +15,7 @@ tests/test_lawson.py — Критерий Лоусона для плазмы.
 import numpy as np
 import pytest
 
-from plasma_monitor import PlasmaMonitor
+from physical_modules.plasma_monitor import PlasmaMonitor
 
 
 # --- Константы ---
