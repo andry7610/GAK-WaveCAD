@@ -12,6 +12,7 @@ Plasma Monitor — модуль плазменной оболочки.
   Принимает внешние напряжения от осмоса, термалки, акустики.
 
 История:
+  v0.3 — автозапитка: плазменное динамо (индукция в стенке, затухание возмущений)
   v0.2 — критерий Лоусона, энергобаланс, временная динамика (step)
   v0.1 — базовая реализация
 """
@@ -104,6 +105,11 @@ class PlasmaMonitor(BaseModule):
         # Временная динамика (v0.2)
         self.sim_time = 0.0
         self.last_balance = None
+
+        # Автозапитка: параметры стенки (v0.3)
+        self.sigma_wall = cfg.get("sigma_wall", 5.96e7)   # Cu, См/м
+        self.delta_wall = cfg.get("delta_wall", 0.01)     # 1 см
+        self.auto_feed_enabled = cfg.get("auto_feed_enabled", True)
 
         self.logger = get_logger("plasma_monitor")
         self.results = None
@@ -494,3 +500,159 @@ class PlasmaMonitor(BaseModule):
         }
 
         return result
+
+    # === Плазма v0.3: Автозапитка — плазменное динамо ===
+
+    def compute_wall_current(self, v_radial: float) -> float:
+        """Ток Фарадея в проводящей стенке.
+
+        J_wall = sigma_wall * v_radial * B
+
+        Где:
+            sigma_wall — проводимость стенки (См/м, медь ~5.96e7)
+            v_radial   — радиальная скорость плазмы к стенке (м/с)
+            B          — магнитное поле плазмы (Тл)
+
+        Возвращает плотность тока (А/м²).
+        """
+        if not self.auto_feed_enabled:
+            return 0.0
+
+        B = self.compute_magnetic_field()
+        J_wall = self.sigma_wall * v_radial * B
+        return float(J_wall)
+
+    def compute_wall_field(self, J_wall: float) -> float:
+        """Магнитное поле от токов в стенке (правило Ленца).
+
+        B_wall = -mu_0 * J_wall * delta_wall
+
+        Знак минус: поле направлено ПРОТИВ движения (восстанавливающая сила).
+        Возвращает поле в Тл.
+        """
+        B_wall = -MU_0 * J_wall * self.delta_wall
+        return float(B_wall)
+
+    def compute_wall_decay_time(self) -> float:
+        """L/R-время затухания токов в стенке.
+
+        tau_wall = mu_0 * sigma_wall * delta_wall * radius
+
+        Для меди (5.96e7 См/м), 1 см стенки, R=0.5 м:
+            tau_wall ≈ 0.375 с
+
+        Возвращает время в секундах.
+        """
+        tau_wall = MU_0 * self.sigma_wall * self.delta_wall * self.radius
+        return float(tau_wall)
+
+    def compute_damping_rate(self) -> float:
+        """Скорость затухания возмущений (1/с).
+
+        gamma = 1 / tau_wall
+
+        Возвращает положительное число (затухание).
+        """
+        tau_wall = self.compute_wall_decay_time()
+        if tau_wall > 0:
+            return float(1.0 / tau_wall)
+        return 0.0
+
+    def compute_auto_feed(self, delta: float, v_radial: float) -> dict:
+        """Полный отклик автозапитки на возмущение.
+
+        Args:
+            delta:     текущее смещение плазмы от центра (м)
+            v_radial:  радиальная скорость (м/с, >0 — к стенке)
+
+        Returns:
+            dict с ключами:
+                J_wall     — ток в стенке (А/м²)
+                B_wall     — поле стенки (Тл, <0 при v>0)
+                F_lorentz  — сила Лоренца (Н/м³, <0 при v>0 — восстанавливающая)
+                tau_wall   — время затухания (с)
+                gamma      — скорость затухания (1/с)
+                damped     — True если возмущение затухнет
+        """
+        if not self.auto_feed_enabled:
+            return {
+                "J_wall": 0.0,
+                "B_wall": 0.0,
+                "F_lorentz": 0.0,
+                "tau_wall": 0.0,
+                "gamma": 0.0,
+                "damped": False,
+            }
+
+        B_plasma = self.compute_magnetic_field()
+        J_wall = self.compute_wall_current(v_radial)
+        B_wall = self.compute_wall_field(J_wall)
+
+        # Сила Лоренца: F = J_plasma × B_wall
+        # J_plasma ~ sigma_wall * v * B (упрощённо — тот же ток)
+        # Знак: при v_radial > 0 (к стенке), B_wall < 0, F < 0 (от стенки)
+        F_lorentz = J_wall * B_wall
+
+        tau_wall = self.compute_wall_decay_time()
+        gamma = self.compute_damping_rate()
+
+        # Возмущение затухает, если gamma > 0 (всегда для реальной стенки)
+        damped = gamma > 0
+
+        return {
+            "J_wall": float(J_wall),
+            "B_wall": float(B_wall),
+            "F_lorentz": float(F_lorentz),
+            "tau_wall": float(tau_wall),
+            "gamma": float(gamma),
+            "damped": bool(damped),
+        }
+
+    def step_auto_feed(self, dt: float, delta: float, v_radial: float) -> dict:
+        """Шаг затухающего осциллятора плазма-стенка.
+
+        Модель: damped harmonic oscillator
+            d²delta/dt² + 2*gamma*ddelta/dt + omega² * delta = 0
+
+        Где:
+            gamma  — скорость затухания (1/tau_wall)
+            omega  — собственная частота (оценка через B_plasma)
+
+        Args:
+            dt:        шаг по времени (с)
+            delta:     текущее смещение (м)
+            v_radial:  текущая скорость (м/с)
+
+        Returns:
+            dict с новыми delta, v_radial и диагностикой
+        """
+        if not self.auto_feed_enabled:
+            return {
+                "delta": float(delta),
+                "v_radial": float(v_radial),
+                "damped": False,
+                "gamma": 0.0,
+            }
+
+        gamma = self.compute_damping_rate()
+
+        # Собственная частота: omega ~ B / sqrt(mu_0 * rho)
+        B = self.compute_magnetic_field()
+        rho = max(self.mass_density, 1e-10)
+        omega = B / np.sqrt(MU_0 * rho)
+
+        # Интегрирование (полунеявный метод Эйлера)
+        a = -2.0 * gamma * v_radial - omega**2 * delta
+        v_new = v_radial + a * dt
+        delta_new = delta + v_new * dt
+
+        # Проверка затухания
+        damped = abs(delta_new) < abs(delta) or abs(v_new) < abs(v_radial)
+
+        return {
+            "delta": float(delta_new),
+            "v_radial": float(v_new),
+            "damped": bool(damped),
+            "gamma": float(gamma),
+            "omega": float(omega),
+        }
