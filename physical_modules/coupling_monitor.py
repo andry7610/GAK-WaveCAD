@@ -14,6 +14,7 @@ Coupling Monitor — кросс-связи между всеми модулям�
 История:
   v0.1 — базовая реализация
   v0.2 — добавлен плазменный модуль
+  v0.3 — подхват Лоусона, dE_dt, tau_E из плазмы v0.2
 """
 
 import numpy as np
@@ -146,7 +147,7 @@ class CouplingMonitor(BaseModule):
             # Плазма ↔ Магноны: магнитное поле плазмы сдвигает Kittel-моды
             B_plasma = self.plasma_results.get("B_field", 0.0)
             magnon = self.magnon_results or {}
-            B_sat = magnon.get("saturation_field", 1.0)
+            B_sat = magnon.get("saturation_field", 1.0) if isinstance(magnon, dict) else 1.0
             k_plasma_magnon = B_plasma / max(B_sat, 1.0)
             results['k_plasma_magnon'] = k_plasma_magnon
 
@@ -155,11 +156,16 @@ class CouplingMonitor(BaseModule):
             k_plasma_em = min(D * 1e4, 1.0)
             results['k_plasma_em'] = k_plasma_em
 
-            # Плазма ↔ Термалка: температура плазмы — обратная связь
+            # Плазма ↔ Термалка: температура плазмы + энергобаланс
             T_plasma = self.plasma_results.get("temperature_plasma", 0.0)
             thermal = self.thermal_results or {}
-            T_thermal = thermal.get("temperature", 300.0)
+            T_thermal = thermal.get("temperature", 300.0) if isinstance(thermal, dict) else 300.0
             k_plasma_thermal = (T_plasma - T_thermal) / max(T_thermal, 1.0) if T_plasma > 0 else 0.0
+
+            # v0.3: энергобаланс dE_dt усиливает thermal coupling
+            dE_dt = self.plasma_results.get("dE_dt", 0.0)
+            if dE_dt > 0:
+                k_plasma_thermal = min(k_plasma_thermal + dE_dt * 1e-6, 1.0)
             results['k_plasma_thermal'] = k_plasma_thermal
 
             # Плазма ↔ Коллапс: барьерный индекс влияет на устойчивость оболочки
@@ -188,6 +194,21 @@ class CouplingMonitor(BaseModule):
         )
         stability = max(0.0, min(1.0, stability))
 
+        # v0.3: штраф за незажигание Лоусона
+        if self.plasma_results:
+            lawson_ok = self.plasma_results.get("lawson_ok", False)
+            if not lawson_ok:
+                stability *= 0.7
+            results['lawson_ok'] = lawson_ok
+            results['lawson_triple'] = self.plasma_results.get("lawson_triple", 0.0)
+            results['tau_E'] = self.plasma_results.get("tau_E", 0.0)
+            results['dE_dt'] = self.plasma_results.get("dE_dt", 0.0)
+        else:
+            results['lawson_ok'] = None
+            results['lawson_triple'] = 0.0
+            results['tau_E'] = 0.0
+            results['dE_dt'] = 0.0
+
         # Фаза плазмы влияет на системный статус
         if self.plasma_results:
             plasma_phase = self.plasma_results.get("phase", "STABLE")
@@ -195,6 +216,8 @@ class CouplingMonitor(BaseModule):
                 system_status = "CRITICAL"
             elif plasma_phase == "CONTACT":
                 system_status = "CRITICAL"
+            elif plasma_phase == "WARNING":
+                system_status = "DEGRADED"
             elif stability > 0.7:
                 system_status = "HEALTHY"
             elif stability > 0.4:
@@ -234,3 +257,8 @@ class CouplingMonitor(BaseModule):
         print(f"    collapse_phase    : {self.results['collapse_phase']}")
         print(f"    stability_index   : {self.results['stability_index']:.3f}")
         print(f"    system_status     : {self.results['system_status']}")
+        # v0.3
+        print(f"    lawson_ok         : {self.results.get('lawson_ok', None)}")
+        print(f"    lawson_triple     : {self.results.get('lawson_triple', 0):.3e}")
+        print(f"    tau_E             : {self.results.get('tau_E', 0):.3e} с")
+        print(f"    dE_dt             : {self.results.get('dE_dt', 0):.3e} Вт/м³")
