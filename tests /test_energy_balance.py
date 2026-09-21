@@ -80,8 +80,8 @@ def test_steady_state_balance():
 
     # Все компоненты должны быть положительными числами
     assert balance["P_fusion"] >= 0, "P_fusion должно быть неотрицательным"
-    assert balance["P_radiation"] >= 0, "P_radiation должно быть неотрицательным"
-    assert balance["P_conduction"] >= 0, "P_conduction должно быть неотрицательным"
+    assert balance["P_rad"] >= 0, "P_rad должно быть неотрицательным"
+    assert balance["P_cond"] >= 0, "P_cond должно быть неотрицательным"
 
     # Проверка аддитивности
     expected_dE = balance["P_fusion"] - balance["P_radiation"] - balance["P_conduction"]
