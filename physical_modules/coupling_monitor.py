@@ -9,14 +9,14 @@ Coupling Monitor — кросс-связи между всеми модулям�
     - тепловой сдвиг осмоса (термалка ↔ осмос)
     - влияние коллапса на геометрию (коллапс → все)
     - плазменные кросс-связи (плазма ↔ все)
-    - вакуумные кросс-связи (плазма ↔ вакуум)
+    - вакуумные кросс-связи (вакуум ↔ плазма, термалка)
   Выдаёт общий индекс стабильности (0..1).
 
 История:
   v0.1 — базовая реализация
   v0.2 — добавлен плазменный модуль
   v0.3 — подхват Лоусона, dE_dt, tau_E из плазмы v0.2
-  v0.4 — вакуум: k_plasma_vacuum, P_gas → плазма
+  v0.4 — вакуум: k_plasma_vacuum, P_gas, k_vacuum_thermal
 """
 
 import numpy as np
@@ -24,6 +24,13 @@ import numpy as np
 from core.base_module import BaseModule
 from core.module_registry import ModuleRegistry
 from core.logger import get_logger
+
+
+def _dict_values(d):
+    """Возвращает только dict-значения из словаря результатов."""
+    if not d or not isinstance(d, dict):
+        return []
+    return [v for v in d.values() if isinstance(v, dict)]
 
 
 @ModuleRegistry.register("coupling_monitor")
@@ -76,10 +83,12 @@ class CouplingMonitor(BaseModule):
 
         # --- 1. Магнитоупругая связь: акустика ↔ магноны ---
         if self.acoustic_results and self.magnon_results:
-            ac_shifts = [r.get('delta_f', 0) for r in self.acoustic_results.values()]
-            mag_shifts = [r.get('df_stress', 0) for r in self.magnon_results.values()]
-            ac_norm = np.sqrt(np.mean(np.square(ac_shifts)))
-            mag_norm = np.sqrt(np.mean(np.square(mag_shifts)))
+            ac_dicts = _dict_values(self.acoustic_results)
+            mag_dicts = _dict_values(self.magnon_results)
+            ac_shifts = [r.get('delta_f', 0) for r in ac_dicts]
+            mag_shifts = [r.get('df_stress', 0) for r in mag_dicts]
+            ac_norm = np.sqrt(np.mean(np.square(ac_shifts))) if ac_shifts else 0.0
+            mag_norm = np.sqrt(np.mean(np.square(mag_shifts))) if mag_shifts else 0.0
             k_magnetoelastic = ac_norm * mag_norm / (ac_norm + mag_norm + 1e-30)
             results['k_magnetoelastic'] = k_magnetoelastic
         else:
@@ -87,10 +96,12 @@ class CouplingMonitor(BaseModule):
 
         # --- 2. Пьезоэлектрическая связь: акустика ↔ EM ---
         if self.acoustic_results and self.em_results:
-            ac_shifts = [r.get('delta_f', 0) for r in self.acoustic_results.values()]
-            em_shifts = [r.get('df_stress', 0) for r in self.em_results.values()]
-            ac_norm = np.sqrt(np.mean(np.square(ac_shifts)))
-            em_norm = np.sqrt(np.mean(np.square(em_shifts)))
+            ac_dicts = _dict_values(self.acoustic_results)
+            em_dicts = _dict_values(self.em_results)
+            ac_shifts = [r.get('delta_f', 0) for r in ac_dicts]
+            em_shifts = [r.get('df_stress', 0) for r in em_dicts]
+            ac_norm = np.sqrt(np.mean(np.square(ac_shifts))) if ac_shifts else 0.0
+            em_norm = np.sqrt(np.mean(np.square(em_shifts))) if em_shifts else 0.0
             k_piezo = ac_norm * em_norm / (ac_norm + em_norm + 1e-30)
             results['k_piezoelectric'] = k_piezo
         else:
@@ -98,10 +109,12 @@ class CouplingMonitor(BaseModule):
 
         # --- 3. Магнитоэлектрическая связь: магноны ↔ EM ---
         if self.magnon_results and self.em_results:
-            mag_freqs = [r.get('f', 0) for r in self.magnon_results.values()]
-            em_freqs = [r.get('f_shifted', 0) for r in self.em_results.values()]
-            mag_mean = np.mean(mag_freqs)
-            em_mean = np.mean(em_freqs)
+            mag_dicts = _dict_values(self.magnon_results)
+            em_dicts = _dict_values(self.em_results)
+            mag_freqs = [r.get('f', 0) for r in mag_dicts]
+            em_freqs = [r.get('f_shifted', 0) for r in em_dicts]
+            mag_mean = np.mean(mag_freqs) if mag_freqs else 0.0
+            em_mean = np.mean(em_freqs) if em_freqs else 0.0
             k_me = abs(mag_mean - em_mean) / (mag_mean + em_mean + 1e-30)
             results['k_magnetoelectric'] = k_me * self.alpha_me_scale
         else:
@@ -142,10 +155,11 @@ class CouplingMonitor(BaseModule):
             # Плазма ↔ Акустика: вязкое напряжение сдвигает резонансные частоты
             sigma_visc = self.plasma_results.get("sigma_viscous", 0.0)
             acoustic = self.acoustic_results or {}
+            ac_dicts = _dict_values(acoustic)
             max_ac_stress = max(
-                (abs(r.get('delta_f', 0)) for r in acoustic.values()),
+                (abs(r.get('delta_f', 0)) for r in ac_dicts),
                 default=1.0
-            )
+            ) if ac_dicts else 1.0
             k_plasma_acoustic = sigma_visc / max(max_ac_stress, 1.0)
             results['k_plasma_acoustic'] = k_plasma_acoustic
 
@@ -184,19 +198,20 @@ class CouplingMonitor(BaseModule):
             results['k_plasma_thermal'] = 0.0
             results['k_plasma_collapse'] = 0.0
 
-        # --- 7. Вакуумные кросс-связи: плазма ↔ вакуум ---
-        if self.plasma_results and self.vacuum_results:
-            # Газовое давление из вакуума охлаждает плазму
-            P_gas = self.vacuum_results.get("pressure", 0.0)
-            T_plasma = self.plasma_results.get("temperature_plasma", 0.0)
-            # Нормировка: 1 Па — умеренное давление для плазменной камеры
+        # --- 7. Вакуумные кросс-связи ---
+        if self.vacuum_results:
+            # Вакуум ↔ Плазма: давление газа влияет на устойчивость плазмы
+            P_gas = self.vacuum_results.get("pressure_gas", 0.0)
             k_plasma_vacuum = min(P_gas / 1.0, 1.0) if P_gas > 0 else 0.0
             results['k_plasma_vacuum'] = k_plasma_vacuum
             results['P_gas'] = P_gas
 
-            # Вакуум ↔ Термалка: отвод тепла через газ
-            pump_speed = self.vacuum_results.get("pump_speed", 0.0)
-            results['k_vacuum_thermal'] = min(pump_speed * 1e3, 1.0)
+            # Вакуум ↔ Термалка: температура газа влияет на тепловой баланс
+            T_gas = self.vacuum_results.get("gas_temp", 300.0)
+            thermal = self.thermal_results or {}
+            T_thermal = thermal.get("temperature", 300.0) if isinstance(thermal, dict) else 300.0
+            k_vacuum_thermal = abs(T_gas - T_thermal) / max(T_thermal, 1.0)
+            results['k_vacuum_thermal'] = k_vacuum_thermal
         else:
             results['k_plasma_vacuum'] = 0.0
             results['P_gas'] = 0.0
@@ -204,17 +219,18 @@ class CouplingMonitor(BaseModule):
 
         # --- 8. Общий индекс стабильности ---
         stability = (
-            results['geom_factor'] * 0.25 +
-            (1.0 - min(results['k_magnetoelastic'], 1.0)) * 0.15 +
-            (1.0 - min(results['k_piezoelectric'], 1.0)) * 0.15 +
-            (1.0 - min(results['k_magnetoelectric'], 1.0)) * 0.10 +
-            (1.0 - min(results['k_thermal_osmosis'], 1.0)) * 0.10 +
-            (1.0 - min(results['k_plasma_acoustic'], 1.0)) * 0.05 +
-            (1.0 - min(results['k_plasma_magnon'], 1.0)) * 0.05 +
-            (1.0 - min(results['k_plasma_collapse'], 1.0)) * 0.05 +
-            (1.0 - min(results['k_plasma_em'], 1.0)) * 0.05 +
-            (1.0 - min(results['k_plasma_thermal'], 1.0)) * 0.05 +
-            (1.0 - min(results['k_plasma_vacuum'], 1.0)) * 0.05
+            results['geom_factor'] * 0.22 +
+            (1.0 - min(results['k_magnetoelastic'], 1.0)) * 0.14 +
+            (1.0 - min(results['k_piezoelectric'], 1.0)) * 0.14 +
+            (1.0 - min(results['k_magnetoelectric'], 1.0)) * 0.08 +
+            (1.0 - min(results['k_thermal_osmosis'], 1.0)) * 0.08 +
+            (1.0 - min(results['k_plasma_acoustic'], 1.0)) * 0.04 +
+            (1.0 - min(results['k_plasma_magnon'], 1.0)) * 0.04 +
+            (1.0 - min(results['k_plasma_collapse'], 1.0)) * 0.04 +
+            (1.0 - min(results['k_plasma_em'], 1.0)) * 0.04 +
+            (1.0 - min(results['k_plasma_thermal'], 1.0)) * 0.04 +
+            (1.0 - min(results['k_plasma_vacuum'], 1.0)) * 0.04 +
+            (1.0 - min(results['k_vacuum_thermal'], 1.0)) * 0.04
         )
         stability = max(0.0, min(1.0, stability))
 
@@ -278,6 +294,7 @@ class CouplingMonitor(BaseModule):
         print(f"    k_plasma_thermal  : {self.results['k_plasma_thermal']:.4e}")
         print(f"    k_plasma_collapse : {self.results['k_plasma_collapse']:.4e}")
         print(f"    k_plasma_vacuum   : {self.results['k_plasma_vacuum']:.4e}")
+        print(f"    k_vacuum_thermal  : {self.results['k_vacuum_thermal']:.4e}")
         print(f"    P_gas             : {self.results['P_gas']:.4e} Па")
         print(f"    geom_factor       : {self.results['geom_factor']:.3f}")
         print(f"    collapse_phase    : {self.results['collapse_phase']}")
