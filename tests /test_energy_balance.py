@@ -17,8 +17,7 @@ tests/test_energy_balance.py — Энергобаланс плазмы.
 import numpy as np
 import pytest
 
-from plasma_monitor import PlasmaMonitor
-
+from physical_modules.plasma_monitor import PlasmaMonitor
 
 # --- Константы ---
 K_B = 1.380649e-23
