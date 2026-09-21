@@ -3,16 +3,20 @@ GAK-WaveCAD — главная точка запуска.
 
 Загружает конфигурацию, инициализирует модули,
 запускает цепочку:
-  осмос → термалка → акустика → коллапс → магноны → EM → плазма → вакуум → кросс-связи.
+  осмос → термалка → акустика → коллапс → магноны → EM → плазма → вакуум → био-мост → кросс-связи.
 
-v0.4 — добавлен VacuumMonitor (8-й модуль) после плазмы.
-       step(dt) в цикле для плазмы и вакуума.
+v0.5 — добавлен BioBridge (9-й модуль).
+       Нейроны → акустический сдвиг → плазма.
+       Плазма → температура → обратная связь на нейроны.
+       Вакуум → P_gas → плазма.
 """
 
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+import numpy as np
 
 from core.config_loader import ConfigLoader
 from core.logger import get_logger
@@ -24,6 +28,7 @@ from physical_modules.magnon_monitor import MagnonMonitor
 from physical_modules.em_resonance_monitor import EMResonanceMonitor
 from physical_modules.plasma_monitor import PlasmaMonitor
 from physical_modules.vacuum_monitor import VacuumMonitor
+from physical_modules.bio_bridge import BioBridge
 from physical_modules.coupling_monitor import CouplingMonitor
 
 
@@ -102,39 +107,56 @@ def main():
     pl_cfg = config.get("plasma_monitor", {})
     plasma = PlasmaMonitor(pl_cfg)
     plasma.init()
-    plasma.run()  # Первый прогон — инициализация
+    plasma.run()
 
     # Модуль 8: вакуум (после плазмы)
     vac_cfg = config.get("vacuum_monitor", {})
     vacuum = VacuumMonitor(vac_cfg)
     vacuum.init()
-    vacuum.run(external={})  # Первый прогон
+    vacuum.run(external={})
 
-    # --- Цикл эволюции: плазма + вакуум ---
+    # Модуль 9: био-мост
+    bio_cfg = config.get("bio_bridge", {})
+    bio = BioBridge(bio_cfg)
+    bio.init()
+
+    # Начальная активность нейронов
+    np_rng = np.random.default_rng(42)
+    neuron_activity = np_rng.uniform(0, 0.8, size=bio.n_neurons)
+
+    # --- Цикл эволюции: плазма + вакуум + био ---
     for step_i in range(N_STEPS):
         # Плазма делает шаг
         plasma.step(dt)
         plasma.run()
 
-        # Вакуум делает шаг: откачка с учётом давления плазмы
+        # Вакуум делает шаг
         pl_results = plasma.get_results()
         T_plasma = pl_results.get("temperature_plasma", 0.0)
-        n_gas = pl_results.get("density", 0.0) * 1e-6  # Часть плотности — нейтральный газ
         vacuum.step(dt, Q_in=0.0, S_pump=vacuum.pump_speed)
         vacuum.run(external={})
 
         vac_results = vacuum.get_results()
-        P_gas = vac_results.get("pressure", 0.0)
+        P_gas = vac_results.get("pressure_gas", 0.0)
+
+        # Био-мост делает шаг: нейроны → акустика → плазма, плазма → обратная связь
+        # Лёгкая стохастическая активность нейронов
+        neuron_activity = np_rng.uniform(0, 1.0, size=bio.n_neurons)
+        bio.step(dt, neuron_activity, T_plasma, P_gas)
 
         if step_i == 0 or step_i == N_STEPS - 1 or (step_i + 1) % 10 == 0:
+            bio_results = bio.get_results()
             logger.info(f"  Шаг {step_i + 1}/{N_STEPS}: "
                         f"T_plasma={T_plasma:.2e} К, "
-                        f"P_gas={P_gas:.2e} Па")
+                        f"P_gas={P_gas:.2e} Па, "
+                        f"spikes={bio_results.get('spike_count', 0)}, "
+                        f"shift={bio_results.get('acoustic_freq_shift', 0):.2f} Гц")
 
     plasma.print_report()
     vacuum.print_report()
+    bio.print_report()
 
-    # Модуль 9: кросс-связи (восемь модулей)
+    # Модуль 10: кросс-связи (девять модулей)
     coupling = CouplingMonitor()
     coupling.init()
     coupling.set_results(
@@ -146,12 +168,13 @@ def main():
         em=em.get_results(),
         plasma=plasma.get_results(),
         vacuum=vacuum.get_results(),
+        bio=bio.get_results(),
     )
     coupling.run()
     coupling.print_report()
 
     logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс → "
-                "магноны → EM → плазма → вакуум → кросс-связи")
+                "магноны → EM → плазма → вакуум → био-мост → кросс-связи")
 
 
 if __name__ == "__main__":
