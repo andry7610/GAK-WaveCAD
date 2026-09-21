@@ -3,7 +3,9 @@ GAK-WaveCAD — главная точка запуска.
 
 Загружает конфигурацию, инициализирует модули,
 запускает цепочку:
-  осмос → термалка → акустика → коллапс → магноны → EM → кросс-связи.
+  осмос → термалка → акустика → коллапс → магноны → EM → плазма → кросс-связи.
+
+v0.3 — добавлен плазма-монитор с циклом step(dt).
 """
 
 import os
@@ -19,6 +21,7 @@ from physical_modules.acoustic_monitor import AcousticMonitor
 from physical_modules.born_collapse_monitor import BornCollapseMonitor
 from physical_modules.magnon_monitor import MagnonMonitor
 from physical_modules.em_resonance_monitor import EMResonanceMonitor
+from physical_modules.plasma_monitor import PlasmaMonitor
 from physical_modules.coupling_monitor import CouplingMonitor
 
 
@@ -28,6 +31,8 @@ def main():
     config_path = os.path.join(os.path.dirname(__file__), "configs", "config.yaml")
     config = ConfigLoader.load(config_path)
     logger.info("Конфигурация загружена")
+
+    # --- Статические модули (один прогон) ---
 
     # Модуль 1: осмос
     osm_cfg = config.get("osmosis_monitor", {})
@@ -88,7 +93,47 @@ def main():
     em.run()
     em.print_report()
 
-    # Модуль 7: кросс-связи
+    # --- Плазма (динамический модуль — цикл step(dt)) ---
+
+    # Модуль 7: плазма
+    plasma_cfg = config.get("plasma_monitor", {})
+    plasma = PlasmaMonitor(plasma_cfg)
+    plasma.init()
+
+    # Внешние напряжения для плазмы
+    acoustic_shift = 0.0
+    if ac_results:
+        shifts = [r.get("delta_f", 0) for r in ac_results.values()]
+        acoustic_shift = sum(shifts) / len(shifts) if shifts else 0.0
+
+    plasma_external_stress = {
+        "sigma_thermal": th_stress,
+        "sigma_osmotic": osm_stress,
+        "acoustic_freq_shift": acoustic_shift,
+    }
+
+    # Первый прогон — начальное состояние
+    plasma.run(external_stress=plasma_external_stress)
+    plasma.print_report()
+
+    # Цикл временной динамики
+    N_STEPS = config.get("simulation", {}).get("n_steps", 100)
+    DT = config.get("simulation", {}).get("dt", 1e-3)
+
+    logger.info(f"Цикл плазмы: {N_STEPS} шагов, dt={DT} с")
+
+    for step in range(N_STEPS):
+        plasma.step(DT)
+        # Обновляем результаты плазмы после каждого шага
+        plasma.run(external_stress=plasma_external_stress)
+
+    plasma.print_report()
+    logger.info(f"После {N_STEPS} шагов: T={plasma.temperature:.3e} К, "
+                f"lawson={plasma.check_lawson()}")
+
+    # --- Кросс-связи (после эволюции плазмы) ---
+
+    # Модуль 8: coupling
     coupling = CouplingMonitor()
     coupling.init()
     coupling.set_results(
@@ -98,14 +143,14 @@ def main():
         collapse=collapse.get_results(),
         magnon=magnon.get_results(),
         em=em.get_results(),
+        plasma=plasma.get_results(),
     )
     coupling.run()
     coupling.print_report()
 
     logger.info("Цепочка выполнена: осмос → термалка → акустика → коллапс → "
-                "магноны → EM → кросс-связи")
+                "магноны → EM → плазма → кросс-связи")
 
 
 if __name__ == "__main__":
     main()
-
