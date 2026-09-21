@@ -17,7 +17,7 @@ tests/test_energy_balance.py — Энергобаланс плазмы.
 import numpy as np
 import pytest
 
-from plasma import PlasmaMonitor
+from plasma_monitor import PlasmaMonitor
 
 
 # --- Константы ---
