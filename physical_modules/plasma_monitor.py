@@ -12,7 +12,7 @@ Plasma Monitor — модуль плазменной оболочки.
   Принимает внешние напряжения от осмоса, термалки, акустики.
 
 История:
-  v0.3 — автозапитка: плазменное динамо (индукция в стенке, затухание возмущений)
+  v0.3 — автозапитка (плазменное динамо, индукция в стенке)
   v0.2 — критерий Лоусона, энергобаланс, временная динамика (step)
   v0.1 — базовая реализация
 """
@@ -106,24 +106,19 @@ class PlasmaMonitor(BaseModule):
         self.sim_time = 0.0
         self.last_balance = None
 
-        # Автозапитка: параметры стенки (v0.3)
-        self.sigma_wall = cfg.get("sigma_wall", 5.96e7)   # Cu, См/м
-        self.delta_wall = cfg.get("delta_wall", 0.01)     # 1 см
+        # Автозапитка (v0.3)
         self.auto_feed_enabled = cfg.get("auto_feed_enabled", True)
+        self.sigma_wall = cfg.get("sigma_wall", 5.96e7)    # медь, См/м
+        self.delta_wall = cfg.get("delta_wall", 0.01)      # 1 см
 
         self.logger = get_logger("plasma_monitor")
         self.results = None
 
     def _apply_fuel_preset(self):
-        """Пересчитать массу иона по топливному пресету.
-
-        Берём массу более тяжёлого иона (основной реагент
-        для термоядерного синтеза).
-        """
+        """Пересчитать массу иона по топливному пресету."""
         if self.fuel_type in FUEL_MASSES:
             masses = FUEL_MASSES[self.fuel_type]
             self.ion_mass = max(masses)
-        # При "custom" — оставляем ion_mass из конфига
 
     def init(self) -> bool:
         self._set_initialized(True)
@@ -135,68 +130,40 @@ class PlasmaMonitor(BaseModule):
         return True
 
     def compute_ekman_layer(self) -> float:
-        """Толщина пристеночного слоя Экмана.
-
-        delta = sqrt(2 * nu / Omega) * R / (R - gap)
-        """
+        """Толщина пристеночного слоя Экмана."""
         if not self.ekman_layer:
             return 0.0
-
         nu = self.viscosity
         Omega = self.rotation_freq
         R = self.radius
         gap = self.gap
-
         delta_base = np.sqrt(2.0 * nu / Omega)
         geom = R / (R - gap)
         return delta_base * geom
 
     def compute_magnetic_field(self) -> float:
-        """Базовое магнитное поле: внешнее + равновесное.
-
-        B = sqrt(B_ext^2 + B_eq^2)
-
-        Вклад Z-пинча добавляется в run(), не здесь.
-        """
+        """Базовое магнитное поле: внешнее + равновесное."""
         B_ext = self.external_B
-
-        # Равновесное (тепловое) поле плазмы
         n = self.density_number
         T = self.temperature
         B_eq = np.sqrt(2.0 * MU_0 * n * K_B * T)
-
         return np.sqrt(B_ext**2 + B_eq**2)
 
     def compute_viscous_stress(self, delta_E: float, B: float) -> float:
-        """Вязкое напряжение в слое Экмана.
-
-        sigma = mu * v / delta_E * suppression(B)
-        Магнитное поле подавляет напряжение.
-        """
+        """Вязкое напряжение в слое Экмана."""
         if delta_E <= 0:
             return 0.0
-
         sigma_0 = self.viscosity * self.flow_velocity / delta_E
-
-        # Подавление магнитным полем
         suppression = 1.0 / (1.0 + (B / self.breakdown_B) ** 4)
-
         return sigma_0 * suppression
 
     def compute_barrier_index(self, delta_E: float, B: float) -> float:
-        """Барьерный индекс устойчивости плазма-стенка (0..1).
-
-        0 — нет барьера (плазма касается стенки),
-        1 — максимальный барьер.
-        """
+        """Барьерный индекс устойчивости плазма-стенка (0..1)."""
         if self.gap <= 0:
             return 0.0
-
         geom = self.gap / (self.gap + delta_E)
         mag = B / (B + self.breakdown_B)
-
         idx = geom * mag
-
         return max(0.0, min(1.0, idx))
 
     def _compute_diffusion_coeff(self, B: float) -> float:
@@ -210,83 +177,49 @@ class PlasmaMonitor(BaseModule):
         """Вклад Z-пинча (бегущее поле) в магнитное поле."""
         if self.z_pinch_freq <= 0:
             return 0.0
-
         omega_p = self.z_pinch_freq * 2.0 * np.pi
         B_z = MU_0 * self.flow_velocity * self.density_number * E_CHARGE / omega_p
-        # Нормируем вклад
         B_z = min(B_z * 1e6, 0.5)
-
         return B_z
 
     def run(self, external_stress=None) -> dict:
-        """Полный прогон модуля.
-
-        Args:
-            external_stress: dict с ключами sigma_thermal, sigma_osmotic,
-                            acoustic_freq_shift (от других модулей).
-
-        Returns:
-            dict с результатами для Coupling Monitor.
-        """
+        """Полный прогон модуля."""
         ext = external_stress or {}
 
-        # --- Базовое магнитное поле ---
         B = self.compute_magnetic_field()
-
-        # --- Вклад Z-пинча (только в run, не в compute_magnetic_field) ---
         B_z = self._compute_z_pinch_field()
         if B_z > 0:
             B = np.sqrt(B**2 + B_z**2)
 
-        # --- Слой Экмана ---
         delta_E = self.compute_ekman_layer()
-
-        # --- Вязкое напряжение ---
         sigma_viscous = self.compute_viscous_stress(delta_E, B)
-
-        # --- Барьерный индекс ---
         barrier = self.compute_barrier_index(delta_E, B)
-
-        # --- Диффузия ---
         diffusion = self._compute_diffusion_coeff(B)
-
-        # --- Температура плазмы ---
         T_plasma = self.temperature
 
-        # Внешнее тепловое напряжение разогревает плазму
         sigma_thermal = ext.get("sigma_thermal", 0.0)
         if sigma_thermal > 0:
             volume = (4.0 / 3.0) * np.pi * self.radius**3
             dT = sigma_thermal * volume / (self.density_number * K_B * self.radius**2)
             T_plasma += dT
 
-        # Осмотическое напряжение — слабый вклад
         sigma_osmotic = ext.get("sigma_osmotic", 0.0)
         if sigma_osmotic > 0:
             T_plasma += sigma_osmotic * 1e-3 / (self.density_number * K_B)
 
-        # Автозапитка: плазменное динамо поддерживает температуру
         if self.auto_feed:
             T_plasma = max(T_plasma, self.temperature)
         else:
-            # Без автозапитки — радиационные потери
             T_plasma *= 0.95
 
-        # --- Угловая частота вращения ---
         Omega = self.rotation_freq
-
-        # Акустический сдвиг меняет скорость вращения
         acoustic_shift = ext.get("acoustic_freq_shift", 0.0)
         if acoustic_shift != 0:
             Omega += acoustic_shift
 
-        # --- Плазменное напряжение на стенку ---
         plasma_stress = sigma_viscous + self.mass_density * self.flow_velocity**2
-
-        # --- Магнитная связь ---
         magnetic_coupling = B / self.breakdown_B
 
-        # --- Фазовое состояние ---
         if B >= self.breakdown_B:
             phase = "BREAKDOWN"
         elif self.gap <= delta_E * 0.5:
@@ -328,52 +261,28 @@ class PlasmaMonitor(BaseModule):
         return self.temperature * K_B / (E_CHARGE * 1e3)
 
     def compute_tau_E(self) -> float:
-        """Время удержания энергии (gyro-Bohm).
-
-        tau_E = C_gB * a² * B² / (sqrt(T_keV) * n_20)
-
-        где n_20 = n / 1e20 (в единицах 10^20 м⁻³),
-        T_keV — температура в кэВ,
-        B — полное магнитное поле (Тл),
-        a — радиус плазмы (м).
-
-        Возвращает время в секундах.
-        """
+        """Время удержания энергии (gyro-Bohm)."""
         T_keV = self._T_to_keV()
         if T_keV <= 0:
             return 0.0
-
         n_20 = self.density_number / 1e20
         if n_20 <= 0:
             return 0.0
-
-        # Полное магнитное поле
         B = self.compute_magnetic_field()
         B_z = self._compute_z_pinch_field()
         if B_z > 0:
             B = np.sqrt(B**2 + B_z**2)
-
         if B <= 0:
             return 0.0
-
         tau_E = C_GYRO_BOHM * self.radius**2 * B**2 / (np.sqrt(T_keV) * n_20)
         return float(tau_E)
 
     def compute_reactivity(self) -> float:
-        """Реактивность <σv>(T) — Bosch-Hale / NRL аппроксимация.
-
-        Возвращает <σv> в м³/с для заданного топлива и температуры.
-
-        D-T:   3.68e-18 * T^(-2/3) * exp(-19.94 * T^(-1/3))
-        D-D:   3.70e-18 * T^(-2/3) * exp(-46.10 * T^(-1/3))
-        D-He3: 5.50e-18 * T^(-2/3) * exp(-38.40 * T^(-1/3))
-        """
+        """Реактивность <σv>(T) — NRL аппроксимация."""
         T_keV = self._T_to_keV()
         if T_keV <= 0:
             return 0.0
-
         T_pow = T_keV ** (-2.0 / 3.0)
-
         if self.fuel_type == "D-T":
             sv = 3.68e-18 * T_pow * np.exp(-19.94 * T_keV ** (-1.0 / 3.0))
         elif self.fuel_type == "D-D":
@@ -381,49 +290,30 @@ class PlasmaMonitor(BaseModule):
         elif self.fuel_type == "D-He3":
             sv = 5.50e-18 * T_pow * np.exp(-38.40 * T_keV ** (-1.0 / 3.0))
         else:
-            # custom — по умолчанию D-T
             sv = 3.68e-18 * T_pow * np.exp(-19.94 * T_keV ** (-1.0 / 3.0))
-
         return float(sv)
 
     def compute_energy_balance(self) -> dict:
-        """Энергобаланс плазмы: P_fusion vs P_rad + P_cond.
-
-        P_fusion — термоядерная мощность (Вт/м³)
-        P_rad    — тормозное излучение Bremsstrahlung (Вт/м³)
-        P_cond   — потери на теплопроводность (Вт/м³)
-        dE_dt    — чистый приток энергии (Вт/м³)
-
-        P_fusion = (n²/4) * <σv> * E_fus    (D-T, D-He3)
-        P_fusion = (n²/2) * <σv> * E_fus    (D-D, одинаковые частицы)
-        P_rad    = 1.69e-38 * Z_eff * n² * sqrt(T_keV)
-        P_cond   = 3 * n * k_B * T / tau_E
-        """
+        """Энергобаланс плазмы: P_fusion vs P_rad + P_cond."""
         T_keV = self._T_to_keV()
         n = self.density_number
         sv = self.compute_reactivity()
         E_fus = FUEL_ENERGY.get(self.fuel_type, 17.6e6 * E_CHARGE)
 
-        # --- Термоядерная мощность ---
         if self.fuel_type == "D-D":
-            # Одинаковые частицы: n_D = n, фактор 1/2
             P_fusion = 0.5 * n**2 * sv * E_fus
         else:
-            # D-T, D-He3: n_D = n_T = n/2
             P_fusion = 0.25 * n**2 * sv * E_fus
 
-        # --- Тормозное излучение (Bremsstrahlung) ---
-        Z_eff = 1.0  # Для чистого топлива Z_eff ≈ 1
+        Z_eff = 1.0
         P_rad = 1.69e-38 * Z_eff * n**2 * np.sqrt(max(T_keV, 0.0))
 
-        # --- Потери на теплопроводность ---
         tau_E = self.compute_tau_E()
         if tau_E > 0:
             P_cond = 3.0 * n * K_B * self.temperature / tau_E
         else:
             P_cond = float('inf')
 
-        # --- Чистый баланс ---
         dE_dt = P_fusion - P_rad - P_cond
 
         result = {
@@ -440,36 +330,19 @@ class PlasmaMonitor(BaseModule):
         return result
 
     def check_lawson(self) -> bool:
-        """Критерий Лоусона: n * T_keV * tau_E >= threshold?
-
-        Пороги:
-            D-T:   3 × 10²¹ кэВ·с/м³
-            D-D:   1 × 10²⁴ кэВ·с/м³
-            D-He3: 1 × 10²² кэВ·с/м³
-
-        Возвращает True, если зажигание возможно.
-        """
+        """Критерий Лоусона: n * T_keV * tau_E >= threshold?"""
         threshold = LAWSON_THRESHOLDS.get(self.fuel_type, 3.0e21)
-
         T_keV = self._T_to_keV()
         tau_E = self.compute_tau_E()
-
         product = self.density_number * T_keV * tau_E
         return product >= threshold
 
     def step(self, dt: float) -> dict:
-        """Один шаг временной динамики.
-
-        dT/dt = (P_fusion - P_rad - P_cond) / (3/2 * n * k_B)
-
-        Обновляет self.temperature и self.sim_time.
-        Возвращает словарь с состоянием после шага.
-        """
+        """Один шаг временной динамики."""
         balance = self.compute_energy_balance()
         n = self.density_number
         dE_dt = balance["dE_dt"]
 
-        # Изменение температуры
         if n > 0:
             dT = dE_dt * dt / (1.5 * n * K_B)
         else:
@@ -477,7 +350,6 @@ class PlasmaMonitor(BaseModule):
 
         self.temperature += dT
 
-        # Защита от нефизичных значений
         if np.isnan(self.temperature):
             self.temperature = 0.0
         if self.temperature < 0:
@@ -501,158 +373,181 @@ class PlasmaMonitor(BaseModule):
 
         return result
 
-    # === Плазма v0.3: Автозапитка — плазменное динамо ===
+    # === Автозапитка (v0.3) — плазменное динамо ===
 
     def compute_wall_current(self, v_radial: float) -> float:
         """Ток Фарадея в проводящей стенке.
 
         J_wall = sigma_wall * v_radial * B
-
-        Где:
-            sigma_wall — проводимость стенки (См/м, медь ~5.96e7)
-            v_radial   — радиальная скорость плазмы к стенке (м/с)
-            B          — магнитное поле плазмы (Тл)
-
-        Возвращает плотность тока (А/м²).
         """
         if not self.auto_feed_enabled:
             return 0.0
-
+        if abs(v_radial) < 1e-30:
+            return 0.0
         B = self.compute_magnetic_field()
-        J_wall = self.sigma_wall * v_radial * B
-        return float(J_wall)
+        B_z = self._compute_z_pinch_field()
+        if B_z > 0:
+            B = np.sqrt(B**2 + B_z**2)
+        J = self.sigma_wall * v_radial * B
+        return float(J)
 
     def compute_wall_field(self, J_wall: float) -> float:
-        """Магнитное поле от токов в стенке (правило Ленца).
+        """Магнитное поле от тока в стенке (правило Ленца — против движения).
 
         B_wall = -mu_0 * J_wall * delta_wall
-
-        Знак минус: поле направлено ПРОТИВ движения (восстанавливающая сила).
-        Возвращает поле в Тл.
         """
+        if not self.auto_feed_enabled:
+            return 0.0
         B_wall = -MU_0 * J_wall * self.delta_wall
         return float(B_wall)
 
     def compute_wall_decay_time(self) -> float:
-        """L/R-время затухания токов в стенке.
+        """L/R-время затухания тока в стенке.
 
-        tau_wall = mu_0 * sigma_wall * delta_wall * radius
-
-        Для меди (5.96e7 См/м), 1 см стенки, R=0.5 м:
-            tau_wall ≈ 0.375 с
-
-        Возвращает время в секундах.
+        tau_wall = mu_0 * sigma_wall * delta_wall * a
         """
-        tau_wall = MU_0 * self.sigma_wall * self.delta_wall * self.radius
-        return float(tau_wall)
+        if self.sigma_wall <= 0 or self.delta_wall <= 0 or self.radius <= 0:
+            return 0.0
+        tau = MU_0 * self.sigma_wall * self.delta_wall * self.radius
+        return float(tau)
 
     def compute_damping_rate(self) -> float:
-        """Скорость затухания возмущений (1/с).
-
-        gamma = 1 / tau_wall
-
-        Возвращает положительное число (затухание).
-        """
-        tau_wall = self.compute_wall_decay_time()
-        if tau_wall > 0:
-            return float(1.0 / tau_wall)
-        return 0.0
+        """Коэффициент затухания gamma = 1 / tau_wall."""
+        tau = self.compute_wall_decay_time()
+        if tau <= 0:
+            return 0.0
+        return 1.0 / tau
 
     def compute_auto_feed(self, delta: float, v_radial: float) -> dict:
-        """Полный отклик автозапитки на возмущение.
-
-        Args:
-            delta:     текущее смещение плазмы от центра (м)
-            v_radial:  радиальная скорость (м/с, >0 — к стенке)
-
-        Returns:
-            dict с ключами:
-                J_wall     — ток в стенке (А/м²)
-                B_wall     — поле стенки (Тл, <0 при v>0)
-                F_lorentz  — сила Лоренца (Н/м³, <0 при v>0 — восстанавливающая)
-                tau_wall   — время затухания (с)
-                gamma      — скорость затухания (1/с)
-                damped     — True если возмущение затухнет
-        """
+        """Полный отклик автозапитки на возмущение."""
         if not self.auto_feed_enabled:
             return {
                 "J_wall": 0.0,
                 "B_wall": 0.0,
                 "F_lorentz": 0.0,
-                "tau_wall": 0.0,
                 "gamma": 0.0,
+                "tau_wall": 0.0,
+                "delta": float(delta),
+                "v_radial": float(v_radial),
                 "damped": False,
+                "auto_feed": False,
             }
 
-        B_plasma = self.compute_magnetic_field()
         J_wall = self.compute_wall_current(v_radial)
         B_wall = self.compute_wall_field(J_wall)
-
-        # Сила Лоренца: F = J_plasma × B_wall
-        # J_plasma ~ sigma_wall * v * B (упрощённо — тот же ток)
-        # Знак: при v_radial > 0 (к стенке), B_wall < 0, F < 0 (от стенки)
-        F_lorentz = J_wall * B_wall
-
+        F_lorentz = J_wall * B_wall * self.delta_wall
         tau_wall = self.compute_wall_decay_time()
-        gamma = self.compute_damping_rate()
-
-        # Возмущение затухает, если gamma > 0 (всегда для реальной стенки)
-        damped = gamma > 0
+        gamma = 1.0 / tau_wall if tau_wall > 0 else 0.0
 
         return {
             "J_wall": float(J_wall),
             "B_wall": float(B_wall),
             "F_lorentz": float(F_lorentz),
-            "tau_wall": float(tau_wall),
             "gamma": float(gamma),
-            "damped": bool(damped),
+            "tau_wall": float(tau_wall),
+            "delta": float(delta),
+            "v_radial": float(v_radial),
+            "damped": True,
+            "auto_feed": True,
         }
 
     def step_auto_feed(self, dt: float, delta: float, v_radial: float) -> dict:
-        """Шаг затухающего осциллятора плазма-стенка.
+        """Шаг затухающего осциллятора (аналитическое решение).
 
-        Модель: damped harmonic oscillator
-            d²delta/dt² + 2*gamma*ddelta/dt + omega² * delta = 0
+        Уравнение: x'' + 2*gamma*x' + omega^2*x = 0
 
-        Где:
-            gamma  — скорость затухания (1/tau_wall)
-            omega  — собственная частота (оценка через B_plasma)
-
-        Args:
-            dt:        шаг по времени (с)
-            delta:     текущее смещение (м)
-            v_radial:  текущая скорость (м/с)
-
-        Returns:
-            dict с новыми delta, v_radial и диагностикой
+        Аналитическое решение устойчиво при любом dt
+        (в отличие от явного Эйлера, который расходится при dt > 2/omega).
         """
         if not self.auto_feed_enabled:
             return {
                 "delta": float(delta),
                 "v_radial": float(v_radial),
+                "J_wall": 0.0,
+                "B_wall": 0.0,
+                "F_lorentz": 0.0,
                 "damped": False,
                 "gamma": 0.0,
+                "omega": 0.0,
+                "auto_feed": False,
             }
 
-        gamma = self.compute_damping_rate()
+        # --- Параметры осциллятора ---
+        tau_wall = self.compute_wall_decay_time()
+        gamma = 1.0 / tau_wall if tau_wall > 0 else 0.0
 
-        # Собственная частота: omega ~ B / sqrt(mu_0 * rho)
         B = self.compute_magnetic_field()
-        rho = max(self.mass_density, 1e-10)
+        B_z = self._compute_z_pinch_field()
+        if B_z > 0:
+            B = np.sqrt(B**2 + B_z**2)
+
+        rho = self.mass_density if self.mass_density > 0 else 1e-3
         omega = B / np.sqrt(MU_0 * rho)
 
-        # Интегрирование (полунеявный метод Эйлера)
-        a = -2.0 * gamma * v_radial - omega**2 * delta
-        v_new = v_radial + a * dt
-        delta_new = delta + v_new * dt
+        # --- Ток и поле (для отчёта) ---
+        J_wall = self.compute_wall_current(v_radial)
+        B_wall = self.compute_wall_field(J_wall)
+        F_lorentz = J_wall * B_wall * self.delta_wall
 
-        # Проверка затухания
-        damped = abs(delta_new) < abs(delta) or abs(v_new) < abs(v_radial)
+        # --- Аналитический шаг ---
+        if omega <= 0 or gamma <= 0:
+            return {
+                "delta": float(delta),
+                "v_radial": float(v_radial),
+                "J_wall": float(J_wall),
+                "B_wall": float(B_wall),
+                "F_lorentz": float(F_lorentz),
+                "damped": False,
+                "gamma": float(gamma),
+                "omega": float(omega),
+                "auto_feed": True,
+            }
+
+        omega2 = omega ** 2
+        gamma2 = gamma ** 2
+
+        if gamma2 < omega2:
+            # --- Underdamped ---
+            omega_d = np.sqrt(omega2 - gamma2)
+            cos_wt = np.cos(omega_d * dt)
+            sin_wt = np.sin(omega_d * dt)
+            exp_decay = np.exp(-gamma * dt)
+
+            delta_new = exp_decay * (
+                delta * cos_wt + (v_radial + gamma * delta) / omega_d * sin_wt
+            )
+            v_new = exp_decay * (
+                v_radial * cos_wt
+                - (gamma * (v_radial + gamma * delta) / omega_d + delta * omega_d) * sin_wt
+            )
+        else:
+            # --- Overdamped ---
+            sqrt_disc = np.sqrt(gamma2 - omega2)
+            r1 = -gamma + sqrt_disc
+            r2 = -gamma - sqrt_disc
+            exp_r1 = np.exp(r1 * dt)
+            exp_r2 = np.exp(r2 * dt)
+
+            A = (v_radial - r2 * delta) / (r1 - r2)
+            B_coeff = (r1 * delta - v_radial) / (r1 - r2)
+
+            delta_new = A * exp_r1 + B_coeff * exp_r2
+            v_new = A * r1 * exp_r1 + B_coeff * r2 * exp_r2
+
+        # --- Защита от nan/inf ---
+        if np.isnan(delta_new) or np.isinf(delta_new):
+            delta_new = 0.0
+        if np.isnan(v_new) or np.isinf(v_new):
+            v_new = 0.0
 
         return {
             "delta": float(delta_new),
             "v_radial": float(v_new),
-            "damped": bool(damped),
+            "J_wall": float(J_wall),
+            "B_wall": float(B_wall),
+            "F_lorentz": float(F_lorentz),
+            "damped": True,
             "gamma": float(gamma),
             "omega": float(omega),
+            "auto_feed": True,
         }
