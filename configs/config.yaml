@@ -1,0 +1,94 @@
+osmosis_monitor:
+  concentration: 300.0
+  temperature: 310.0
+  membrane_thickness: 1.0e-09
+  hydraulic_permeability: 1.0e-12
+  reflection_coeff: 0.9
+thermal_monitor:
+  R: 0.05
+  h: 0.002
+  T_inner: 310.0
+  T_outer: 293.0
+  k_thermal: 15.0
+  alpha_inner: 100.0
+  alpha_outer: 10.0
+acoustic_monitor:
+  R: 0.05
+  h: 0.002
+  rho: 2700.0
+  E_young: 70000000000.0
+  nu: 0.3
+  n_modes: 4
+born_collapse_monitor:
+  R: 0.05
+  h: 0.002
+  P_crit: 3914000.0
+magnon_monitor:
+  R: 0.05
+  h: 0.002
+  B_ext: 0.1
+  M_s: 140000.0
+  lambda_s: -5.9e-06
+  gamma: 176086000000.0
+  n_modes: 4
+em_resonance_monitor:
+  R: 0.05
+  h: 0.002
+  eps_r: 10.0
+  n_modes: 4
+  Q_factor: 500
+plasma_monitor:
+  radius: 0.01
+  shell_thickness: 0.0001
+  plasma_gap: 0.0005
+  density_number: 1.0e+20
+  temperature: 5000000.0
+  viscosity: 1.0e-05
+  mass_density: 0.001
+  rotation_freq: 1000.0
+  flow_velocity: 10000.0
+  z_pinch_freq: 12530000.0
+  auto_feed: true
+  ekman_layer: true
+  coriolis_enabled: true
+  quantum_feedback: true
+  pair_energy_gain: 2.0e-05
+  ion_charge: 1.0
+  ion_mass: 1.673e-27
+  collision_freq: 1000000000.0
+  external_B: 50.0
+  breakdown_B: 60.0
+  barrier_threshold: 0.3
+  fuel_type: D-He3
+  auto_feed_enabled: true
+  sigma_wall: 59600000.0
+  delta_wall: 0.01
+  Z_eff: 1.0
+  radiation_scale: 0.003
+vacuum_monitor:
+  P_initial: 100000.0
+  T_gas: 300.0
+  pump_speed: 0.01
+  volume: 0.001
+  leak_rate: 0.001
+bio_bridge:
+  n_neurons: 100
+  firing_rate: 10.0
+  decay_tau: 0.1
+  threshold: 0.2
+  refractory: 0.002
+  coupling_strength: 1.0
+  acoustic_coupling: 0.01
+  plasma_feedback_gain: 5.0
+  vacuum_coupling: 0.0001
+quantum_vacuum:
+  gap: 3.5e-09
+  area: 1.0e-06
+  E_field: 1.0e+18
+  volume: 1.0e-18
+  dt: 1.0e-09
+  plasma_coupling: 0.01
+  T_ref: 1000000.0
+simulation:
+  n_steps: 10000
+  dt: 1.0e-06
