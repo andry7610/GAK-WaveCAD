@@ -9,9 +9,6 @@ venv/
 # Streamlit
 .streamlit/
 
-# Results (данные, не код)
-results/
-
 # IDE
 .vscode/
 .idea/
@@ -22,3 +19,16 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Optuna базы и флаг — не таскаем в git (архивы храним локально)
+models/*.db
+models/STOP_FLAG
+
+# Results: по умолчанию игнорим экспорты, но рекордные держим в гите
+results/*
+!results/v37_2_champion_export.csv
+!results/v37_2_trials_50.csv
+
+# AI-модель фильтра — нужна оптимизатору, живёт локально
+models/ai_predictor_DT.json
+
