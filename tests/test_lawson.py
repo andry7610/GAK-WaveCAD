@@ -2,6 +2,10 @@
 Критерий Лоусона: зажигается ли термоядерная реакция?
 
 n * T * tau_E >= threshold (зависит от топлива)
+
+v37.2: модель ужесточила tau_E — ITER-точка (n=1e20, T=1.16e8, B=10) даёт
+n*T*tau_E = 1.83e21 против порога 3e21. Тестовая точка усилена (n, T, B)
+с запасом с ОБЕИХ сторон: D-T должен зажигаться, D-D и D-He3 — нет.
 """
 
 import numpy as np
@@ -40,15 +44,17 @@ def _make_plasma(**kwargs):
 
 
 def test_lawson_dt_above_threshold():
-    """D-T: ITER-масштаб → n*T*tau_E > 3e21 → зажигается."""
-    # v37.2: модель ужесточила tau_E (~1.83 c вместо >3 c при старых параметрах),
-    # поэтому плотность поднята с 1.0e20 до 2.5e20 — произведение Лоусона
-    # уверенно пробивает порог 3e21 с запасом.
+    """D-T: усиленная точка -> n*T*tau_E > 3e21 -> зажигается.
+
+    v37.2: при старой точке (n=1e20, T=1.16e8, B=10) произведение
+    давало 1.83e21 < 3e21 (tau_E ужесточён в v0.15). Плотность,
+    температура и поле подняты с запасом.
+    """
     p = _make_plasma(
-        density_number=2.5e20,
-        temperature=1.16e8,   # ~10 кэВ
-        external_B=10.0,      # сильное поле
-        radius=1.0,           # ITER-масштаб
+        density_number=2.5e20,  # v37.2: усиленная точка (запас к порогу)
+        temperature=1.5e8,      # ~13 кэВ — ближе к пику <sigma v> для D-T
+        external_B=13.0,        # сильное поле -> большое tau_E
+        radius=1.0,             # ITER-масштаб
         fuel_type="D-T",
     )
 
@@ -70,7 +76,7 @@ def test_lawson_dt_above_threshold():
 
 
 def test_lawson_dt_below_threshold():
-    """D-T: малые параметры → n*T*tau_E < 3e21 → не зажигается."""
+    """D-T: малые параметры -> n*T*tau_E < 3e21 -> не зажигается."""
     p = _make_plasma(
         density_number=1.0e19,
         temperature=1.16e7,   # ~1 кэВ
@@ -102,14 +108,16 @@ def test_lawson_dt_below_threshold():
     ("D-He3", 1.0e22),
 ])
 def test_lawson_uses_correct_threshold(fuel, threshold):
-    """Порог Лоусона зависит от типа топлива."""
-    # v37.2: плотность поднята с 1.0e20 до 2.5e20 (см. test_lawson_dt_above_threshold);
-    # D-D и D-He3 всё равно остаются ниже своих порогов (1e24 и 1e22).
+    """Порог Лоусона зависит от типа топлива.
+
+    v37.2: точка усилена так же, как в test_lawson_dt_above_threshold —
+    запас подобран, чтобы D-T зажигался, а D-He3 (порог 1e22) ещё нет.
+    """
     p = _make_plasma(
-        density_number=2.5e20,
-        temperature=1.16e8,  # 10 кэВ
-        external_B=10.0,
-        radius=1.0,           # ITER-масштаб
+        density_number=2.5e20,  # v37.2: усиленная точка (запас к порогу)
+        temperature=1.5e8,      # ~13 кэВ
+        external_B=13.0,        # сильное поле
+        radius=1.0,             # ITER-масштаб
         fuel_type=fuel,
     )
 
@@ -121,8 +129,9 @@ def test_lawson_uses_correct_threshold(fuel, threshold):
     expected_threshold = LAWSON_THRESHOLDS[fuel]
     assert expected_threshold == threshold
 
-    # D-T с ITER-параметрами зажигается; D-D и D-He3 — нет (порог выше)
+    # D-T зажигается; D-D и D-He3 — нет (порог выше)
     if fuel == "D-T":
         assert p.check_lawson() is True
     else:
         assert p.check_lawson() is False
+
