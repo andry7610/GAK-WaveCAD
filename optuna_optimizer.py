@@ -1,56 +1,6 @@
 """
-GAK-WaveCAD — Optuna-оптимизатор v37.2.
- v37.2: FIX-пакет (сирена ДипСика + аудит Алисы):
-      (1) objective_ignition/objective_gain возвращают -P_net_W (ЧИСТАЯ мощность
-          станции) — TPE впервые видит налог B^2*pump^2 на рециркуляцию;
-      (2) FIX pump_speed: для золы и рециркуляции берётся из cfg["vacuum_monitor"]
-          (был неверный словарь plasma_monitor — ползунок откачки не влиял НИ НА ЧТО,
-          и зола, и ALIP считались с дефолтом 0.0665);
-      (3) прунер репортит чистую мощность (зола + станционный баланс) — та же шкала,
-          что и objective;
-      (4) set_user_attr P_net_W/P_electric_W в оба objective (видны в CSV);
-      (5) best_value и success-сообщения — на P_net.
- v37: ГРЯЗНАЯ ПЛАЗМА (совет трёх КБ):
-      (1) гелиевая зола — равновесная доля f_He из баланса рождение/откачка:
-          f_He = min(F_HE_MAX, C_ASH * R_burn / (n * V * pump_speed)); pump_speed
-          впервые становится настоящей ручкой откачки, а не декорацией.
-          Разбавление топлива: n_fuel = n*(1-f_He), мощность ∝ (1-f_He)^2,
-          P_alpha ∝ (1-f_He)^2, Лоусон по n_fuel.
-          Калибровка C_ASH: f_He≈0.15 на точке рекорда 1527 МВт
-          (n=1.6e21, V=0.974 м3, pump=0.0615).
-      (2) вольфрам: c_W=1e-4 константой → Z_eff = 1 + c_W*Z*(Z-1) ≈ 1.54,
-          бремсштрулунг P_rad *= Z_eff (первое приближение, динамика T не пересчитывается).
-      (3) pump_speed расширен до (0.01, 0.15) — BOUNDS, IGNITION_BOUNDS, burn-фаза.
-      (4) границы v36.2/v36.3 включены: T_plasma_init до 1.6e8, n_density до 1.6e21,
-          pl_radius до 620 (сейфти R*0.52 на месте).
-      (5) сиды: чемпион trial-4 (1282 МВт, trial 31 старого прогона) и рекорд
-          1527 МВт (n=1.6e21, pl=615) + разведка 1.55e21/615.
- v36.1: FIX (ревью ДипСика): pump_speed берётся из cfg["vacuum_monitor"] (был неверный
-      словарь — рециркуляция ALIP не реагировала на pump_speed); убран дубль
-      set_user_attr("beta") в objective_ignition; дефолт n_steps синхронизирован
-      с _build_trial_config (pruner и триал всегда считают один и тот же прогон).
- v32 (историческая версия):
-v22: FIX init() temp reset + cascade burn-phase MHD switch.
-v26: BOUNDS k_thermal (20,90), n_density (6e20,1.3e21) — пробить брейкивен.
-v31: objective=P_fusion (total power), Q>=4.8 + lawson constraints, sim_time=1s.
- v32: честный энергобаланс - Q_plasma (P_alpha/P_loss), f_ext (доля внешнего подогрева),
-      каскадный КПД, тритий, когенерация. Патч КБ «Два звездабола».
- v33: FIX размерностей (замечания ОТК): f_ext и P_fusion — полные ватты, а не Вт/м3;
-      дубли _run_quick убраны; user_attrs Q_plasma/f_ext/P_fusion_W; seed=43, n_startup=10.
- v34: прунер репортит полную мощность (Вт) — та же шкала, что objective; третий seed
-      (trial 29: 460.7 МВт при f_ext=2.1%); сэмплер ignition 43/10.
- v35: мягкая остановка STOP_FLAG (models/STOP_FLAG → study.stop() между trial),
-      catch=(Exception,) — сбой одного trial не роняет прогон.
- v36: судья на разогреве не работает — warmup 50% прогона, репорты на 50–87.5%;
-      β-метрика (MHD) + мягкий штраф β>8%; n_density до 1.5e21 + разведка 1.5e21
-      с дедупликацией; рециркуляция = криогеника + ALIP ~ (B·v)² (налог B²).
-v21: FIX T_outer BOUNDS (273,300) — золотая зона, seeds внутри границ.
-v20: динамический pl_radius с safety check.
-v19: BOUNDS — золотая зона из 50 trials (trial 44, Q=4.54).
-v15: каскадная оптимизация (зажигание → горение) с плавным переходом и штрафом за нестабильность.
-v9.3: constraint pl_radius, синхронизация B, честные метрики.
-v10: golden band B=28-30T, R>=600mm, n_steps from base_config.
-v11: суженные BOUNDS (golden zone из 50 trials), MedianPruner, seed best params.
+GAK-WaveCAD — Optuna-оптимизатор v46Q (флаги экономики + ось B=15 + фикс ямы разведки).
+
 """
 
 import optuna
@@ -96,6 +46,57 @@ except ImportError:
     def _get_ai_predictor(script_dir):
         return None
 # === END AI TRANSFORMER FILTER ===
+
+
+# === v46G: SEED-AWARE PRUNER ===
+class SeedAwarePruner(optuna.pruners.BasePruner):
+    """v46G: медиана отсечения — только по не-сидовым COMPLETE-триалам.
+    Сиды (user_attrs["seed"]) — эталонные точки смоука: в выборку отсечения
+    не входят и сами не прунятся никогда (смоук обязан доходить до финала
+    бит в бит). Защитный режим: не-сидовых COMPLETE меньше n_min_trials —
+    прунер молчит, кандидаты добегают до финала (run9: не-сидовых COMPLETE
+    ноль — TPE нечему было учиться)."""
+
+    def __init__(self, n_startup_trials=10, n_warmup_steps=0, interval_steps=1,
+                 n_min_trials=3):
+        self.n_startup_trials = int(n_startup_trials)
+        self.n_warmup_steps = int(n_warmup_steps)
+        self.interval_steps = max(1, int(interval_steps))
+        self.n_min_trials = max(2, int(n_min_trials))
+
+    def prune(self, study, trial):
+        try:
+            complete = [t for t in study.get_trials(deepcopy=False)
+                        if t.state == optuna.trial.TrialState.COMPLETE]
+        except Exception:
+            return False
+        if len(complete) < self.n_startup_trials:
+            return False
+        # сиды — не планка: смоук не задаёт планку отсечения
+        nonseed = [t for t in complete
+                   if not (t.user_attrs or {}).get("seed", False)]
+        if len(nonseed) < self.n_min_trials:
+            return False
+        # сам сид не прунится никогда — смоук бит в бит
+        if (trial.user_attrs or {}).get("seed", False):
+            return False
+        step = trial.last_step
+        if step is None or step < self.n_warmup_steps:
+            return False
+        if step % self.interval_steps != 0:
+            return False
+        vals = []
+        for t in nonseed:
+            if t.number == trial.number:
+                continue
+            v = t.intermediate_values.get(step)
+            if v is not None:
+                vals.append(float(v))
+        if len(vals) < self.n_min_trials:
+            return False
+        med = float(np.median(vals))
+        return float(trial.intermediate_values[step]) > med
+# === END SEED-AWARE PRUNER ===
 
 
 # v11: лучшие параметры из 50 trials (trial 44, Q=4.54)
@@ -153,20 +154,20 @@ class GAKOptunaOptimizer:
     # Плохие (Q<3): pl_radius<530, n<6e20, P_initial>100, gap>10, R<1150, B>32
     # Хорошие (Q>4): pl_radius 530-595, n 7-10e20, P_initial<2, gap 1-8, R 1150-1200, B 28-31
     BOUNDS = {
-        "R_mm":           (1140, 1210),    # v21: золотая зона (trial 44: 1194.66)
+        "R_mm":           (1200, 5500),    # v45R: реалистичное окно (станция, а не игрушечный шар)
         "h_mm":           (10.0, 18.0),    # v21: золотая зона (trial 44: 14.33)
         "T_inner":        (360.0, 420.0),  # v21: золотая зона (trial 44: 387.74)
         "T_outer":        (273.0, 300.0),   # v21: FIX — было (273,280), но seed=287.89!
         "k_thermal":      (20.0, 90.0),     # v26: расширено вниз — пробить брейкивен
-        "pl_radius_mm":    (500, 620),       # v36.3: 610->620 (рекорд 1527 МВт при 615)
+        "pl_radius_mm":    (500, 2860),      # v45R: кламп 620 снят (0.52*5500)
         "T_plasma_init":  (1e8, 1.6e8),     # v36.2: 1.5e8->1.6e8 (над сид-чемпионом 155.7 МК)
-        "n_density":      (6e20, 1.6e21),   # v36.3: 1.5e21->1.6e21 (β-штраф контролирует)
+        "n_density":      (1e20, 3.6e21),  # v45R: потолок динамический (0.8*n_G), низ 1e20
         "fuel_type_idx":  (0, 2),
         "P_initial":      (0.01, 3.0),      # v21: золотая зона (trial 44: 0.0712)
-        "pump_speed":     (0.01, 0.15),     # v37: реальная ручка откачки золы (было 0.07)
-        "E_field":        (2.5e17, 6e17),   # v25: сужено — плавный градиент Швингера
+        "pump_speed":     (0.01, 0.22),  # v43     # v42: 0.18->0.20 — зола растёт с плотностью 3.2e21
+        "E_field":        (9e16, 2.34e17),  # v45R: масштаб по полю (0.9-1.8)e16 * B
         "gap_nm":          (1, 8),            # v21: золотая зона (trial 44: 1)
-        "external_B":     (28.0, 31.0),     # v21: золотая зона (trial 44: 28.71)
+        "external_B":     (10.0, 13.0),     # v45R: реалистичное окно (SPARC 12.2 Тл, ITER-класс)
     }
 
     T_CAP = 1e9  # 1000 МК — выше это runaway
@@ -178,20 +179,20 @@ class GAKOptunaOptimizer:
 
     IGNITION_BOUNDS = {
         # v21: золотая зона
-        "R_mm":           (1140, 1210),
+        "R_mm":           (1200, 5500),    # v45R: синхрон с BOUNDS
         "h_mm":           (10.0, 18.0),
         "T_inner":        (360.0, 420.0),
         "T_outer":        (273.0, 300.0),   # v21: FIX — было (273,282)
         "k_thermal":      (20.0, 90.0),  # v26: расширено вниз
-        "pl_radius_mm":    (500, 620),       # v36.3: 610->620; динамический сейфти R*0.52
+        "pl_radius_mm":    (500, 2860),      # v45R: кламп снят
         "T_plasma_init":  (1e8, 1.6e8),     # v36.2
-        "n_density":      (6e20, 1.6e21),   # v36.3
-        "external_B":     (28.0, 31.0),
+        "n_density":      (1e20, 3.6e21),  # v45R: потолок динамический (0.8*n_G), низ 1e20
+        "external_B":     (10.0, 13.0),     # v45R: синхрон с BOUNDS
         "gap_nm":          (1, 8),
         # Фаза-специфичные (зажигание — нужен мощный импульс)
-        "E_field":        (2.5e17, 6e17),   # v25: синхрон с BOUNDS
+        "E_field":        (9e16, 2.34e17),  # v45R: масштаб по полю (0.9-1.8)e16 * B
         "P_initial":      (0.01, 3.0),
-        "pump_speed":     (0.01, 0.15),     # v37
+        "pump_speed":     (0.01, 0.22),  # v43     # v42: 0.18->0.20 (синхрон с BOUNDS)
     }
 
     # BURN_BOUNDS задаётся динамически вокруг top-N из Phase 1
@@ -211,15 +212,29 @@ class GAKOptunaOptimizer:
     FIXED_FUEL_IDX = 1  # D-T
     # -- v32: константы станции (съём энергии) --
     ETA_MHD = 0.22           # КПД МГД-топпинга (0.15-0.30, трактовка: от теплового потока)
-    ETA_STEAM = 0.42         # КПД парового нижнего цикла
+    ETA_STEAM = 0.42         # КПД парового нижнего цикла (legacy)
+    ETA_BRAYTON_HE = 0.48    # v46B: КПД гелиевого Брайтона (верх комбинированного цикла)
+    ETA_SCO2_BOTTOMING = 0.185  # v46B: КПД sCO2-низа на выхлопе Брайтона
+    COOLANT = "he_brayton_sco2"  # v46B: "steam" | "he_brayton" | "he_brayton_sco2"
     RECIRC_FRAC = 0.04       # legacy-константа (дефолт, если B/v не переданы)
+
+    @classmethod
+    def _eta_low(cls):
+        """v46B: единая формула нижнего каскада — станция и прунер считают одинаково."""
+        if cls.COOLANT == "he_brayton_sco2":
+            return cls.ETA_BRAYTON_HE + (1.0 - cls.ETA_BRAYTON_HE) * cls.ETA_SCO2_BOTTOMING
+        return cls.ETA_BRAYTON_HE if cls.COOLANT == "he_brayton" else cls.ETA_STEAM
     # v36: рециркуляция = криогеника магнитов + ALIP-прокачка (налог МГД ~ (B·v)^2)
     RECIRC_CRYO_FRAC = 0.02
     RECIRC_PUMP_FRAC = 0.02
     RECIRC_REF_B = 28.71
     RECIRC_REF_PUMP = 0.0665
-    BETA_MAX = 0.08          # v36: предел MHD-беты (штраф в objective)
+    BETA_MAX = 0.15          # v42: было 0.12 (v39) — сдвинут по экспорту v41:
+                         # raw растёт с beta монотонно (0.17->2187 МВт), физической стены
+                         # в модели НЕТ (MHD не моделируется). 0.15 — эмпирический потолок,
+                         # предохранитель от нефизичного runaway, а не физический лимит
     MU0 = 1.25663706212e-6   # магнитная постоянная
+    SAFETY_Q = 2.0           # v41: прокси q_95 для лимита Гринвальда (справочная метрика)
     SYNC_HARVEST_FRAC = 0.15 # доля нетто-синхротрона, отдаваемая ИК-конвертерам
     SYNC_CONV_EFF = 0.40     # КПД ИК-конвертеров
     T_BR = 1.05              # коэффициент воспроизводства трития
@@ -240,26 +255,125 @@ class GAKOptunaOptimizer:
     C_W = 1.0e-4             # доля вольфрама (первая итерация — константа)
     Z_W = 74                 # атомный номер вольфрама
 
+    # ── v44: ЭКОНОМИКА (режим "lcoe") ──
+    WALL_LIMIT_W_M2 = 18.0e6      # v46D.1 (46.2 зонд): чешуя держит 18 МВт/м2 (было 12)
+    WALL_SOFT_PENALTY = False     # v46D.1: мягкий штраф снят — зонд меряет сырой потолок
+    WALL_DIAMOND_ONSET = 12.0e6   # v46D.1: надбавка чешуи только выше старого лимита
+    C_DIAMOND = 0.0               # v46D.1: цена чешуи — КАЛИБРУЕТСЯ ПОСЛЕ ЗОНДА (брейк-ивен ~0.06)
+    C_ALIGN = 0.15                # v46C (46.8): цена изолирующих покрытий alignment
+    PRESCREEN_ENABLED = False     # v46C: гейт инертен (AutoLearn учится, не стреляет)
+    COIL_H_M = 0.5                # эффективная толщина обмотки, м
+    COIL_COST_PER_MJ = 80e3       # $/МДж запасённой энергии (якорь: ITER-класс)
+    BOP_COST_PER_KW = 3900.0      # v46B: $/кВт эл. — пар 3500 + второй контур sCO2 (+400; брейк-ивен 4050)
+    BLANKET_COST_PER_KW = 1500.0  # $/кВт тепловой (бланкет + первая стенка; power-режим)
+    BLANKET_COST_PER_M2 = 16029966.545501301  # v46H: $/м2 (якорь: S9 run10, невязка 0.0)
+    MATERIALS = {"steel": (12.0e6, 0.0), "tpg": (18.0e6, 0.05), "c_c_sic": (22.0e6, 0.10), "c_c_sic_adv": (25.0e6, 0.15)}  # v46L: adv по ТЗ Дипсика — потолок 25, наценка 15%
+    CRYO_HEAT_BASE_W = 1.0e4      # статический теплоприход на катушки при 4.2 K, Вт
+    CRYO_PENETRATION = 1e-5       # нейтронный нагрев катушек: доля P_fusion
+    CRYO_CARNOT = 70.0            # Вт электричества на 1 Вт холода (класс 4-20 K)
+    ELEC_PRICE_PER_KWH = 0.05     # внутренняя цена электричества, $/кВт·ч
+    OPEX_FRAC = 0.05              # прочий OPEX: 5% CAPEX в год
+    CRF = 0.0806                  # capital recovery factor (7%, 30 лет)
+    CAPACITY_FACTOR = 0.85
+    TRITIUM_PRICE_PER_KG = 30e3   # тритий — актив: избыток продаём
+
     @classmethod
-    def _station_balance(cls, P_fusion_W, P_sync_net_W, B_T=None, pump_speed=None):
+    def greenwald_limit(cls, B_T, pl_radius_m):
+        """v41: справочный лимит Гринвальда [м^-3].
+        Прокси тока плазмы из равновесия: I_p = 2*pi*a*B/(mu0*q), q=SAFETY_Q.
+        n_G = I_p[MA] * 1e20 / (pi * a^2). Метрика для user_attrs, не constraint."""
+        if not B_T or not pl_radius_m or pl_radius_m <= 0:
+            return float("nan")
+        a = float(pl_radius_m)
+        I_p_A = 2.0 * np.pi * a * float(B_T) / (cls.MU0 * cls.SAFETY_Q)
+        return (I_p_A / 1e6) * 1e20 / (np.pi * a * a)
+
+    def _economics(self, cfg, m):
+        """v44: LCOE и нагрузка на первую стенку (вызывается при mode="lcoe").
+        Якоря — порядки величин ITER/DEMO-класса, НЕ точная смета: цель — дать
+        оптимизатору правильный градиент цены, а не рублёвую точность."""
+        station = m.get("station") or {}
+        P_fusion = float(m.get("avg_P_fusion_W", 0.0) or 0.0)
+        P_elec = float(station.get("P_electric_W", 0.0) or 0.0)
+        P_net = float(station.get("P_net_W", 0.0) or 0.0)
+        m_T_net = float(station.get("m_T_net_kg_year", 0.0) or 0.0)
+        tm = cfg.get("thermal_monitor") or {}
+        R_m = float(tm.get("R", 0.0) or 0.0)
+        if R_m <= 0:
+            R_m = float(tm.get("R_mm", 0.0) or 0.0) / 1000.0
+        B_T = float((cfg.get("plasma_monitor") or {}).get("external_B", 0.0) or 0.0)
+        E_mag_J = (B_T ** 2) / (2.0 * self.MU0) * 4.0 * np.pi * R_m * R_m * self.COIL_H_M
+        cost_mag = E_mag_J / 1e6 * self.COIL_COST_PER_MJ
+        # v46Q: внутренний эмиттер — магнитная система дешевле вдвое
+        if (cfg.get("economy_flags") or {}).get("emitter", False):
+            cost_mag *= 0.5
+        cost_bop = P_elec / 1000.0 * self.BOP_COST_PER_KW
+        # v46H: бланкет ПО ПЛОЩАДИ (4*pi*R^2) с наценкой материала
+        _mat = (cfg.get("vacuum_monitor") or {}).get("wall_material", "steel")
+        _mat_mult = 1.0 + self.MATERIALS.get(_mat, self.MATERIALS["steel"])[1]
+        cost_blanket = 4.0 * np.pi * R_m * R_m * self.BLANKET_COST_PER_M2 * _mat_mult
+        # v46D.1 (46.2): алмазная чешуя — надбавка только в зоне выше старого лимита 12
+        if self.C_DIAMOND > 0.0 and P_fusion > 0 and R_m > 0:
+            if P_fusion / (4.0 * np.pi * R_m * R_m) > self.WALL_DIAMOND_ONSET:
+                cost_blanket *= (1.0 + self.C_DIAMOND)
+        # v46C (46.8): изолирующие покрытия прокачки вдоль силовых линий
+        al_vm = float((cfg.get("vacuum_monitor") or {}).get("alignment", 0.0) or 0.0)
+        cost_blanket *= (1.0 + self.C_ALIGN * al_vm * al_vm)
+        # v46Q: сварной силовой корпус RAFM (постановление штаба 15.11) — бланкет дешевле на 30%
+        if (cfg.get("economy_flags") or {}).get("welded_vessel", False):
+            cost_blanket *= 0.7
+        capex = cost_mag + cost_bop + cost_blanket
+        cryo_heat_W = self.CRYO_HEAT_BASE_W * (B_T / 12.0) ** 2 + self.CRYO_PENETRATION * P_fusion
+        opex_cryo = cryo_heat_W * self.CRYO_CARNOT / 1000.0 * 8760.0 * self.ELEC_PRICE_PER_KWH
+        opex_T = -m_T_net * self.TRITIUM_PRICE_PER_KG  # тритий — актив
+        annual = self.CRF * capex + opex_cryo + self.OPEX_FRAC * capex + opex_T
+        area = 4.0 * np.pi * R_m * R_m
+        wall_load = P_fusion / area if area > 0 else float("inf")
+        if self.WALL_SOFT_PENALTY and wall_load > self.WALL_LIMIT_W_M2:
+            wall_mult = (wall_load / self.WALL_LIMIT_W_M2) ** 2
+        else:
+            wall_mult = 1.0  # v46D.1: штраф снят (зонд)
+        E_year_MWh = P_net / 1e6 * 8760.0 * self.CAPACITY_FACTOR
+        lcoe_raw = annual / E_year_MWh if E_year_MWh > 0 else 1e10
+        return {"lcoe": lcoe_raw * wall_mult, "lcoe_raw": lcoe_raw,
+                "wall_load_W_m2": wall_load, "wall_penalty_mult": wall_mult,
+                "cost_mag": cost_mag, "cost_bop": cost_bop,
+                "cost_blanket": cost_blanket, "cost_cryo_W": cryo_heat_W}
+
+    def _wall_load(self, cfg, m):
+        """v45R: нагрузка на первую стенку [Вт/м2] = P_fusion / (4*pi*R^2)."""
+        tm = cfg.get("thermal_monitor") or {}
+        R_m = float(tm.get("R", 0.0) or 0.0)
+        if R_m <= 0:
+            R_m = float(tm.get("R_mm", 0.0) or 0.0) / 1000.0
+        P_fusion = float(m.get("avg_P_fusion_W", 0.0) or 0.0)
+        area = 4.0 * np.pi * R_m * R_m
+        return P_fusion / area if area > 0 else float("inf")
+
+    @classmethod
+    def _station_balance(cls, P_fusion_W, P_sync_net_W, B_T=None, pump_speed=None, alignment=0.0):  # v46A
         # v32: энергобаланс станции. Зовётся из _run_quick с усреднёнными мощностями.
         rate = P_fusion_W / cls.E_DT if cls.E_DT > 0 else 0.0   # реакций/с
         m_T_burn = rate * cls.M_TRITIUM * cls.SECONDS_PER_YEAR   # кг трития сжигается/год
         m_T_net = m_T_burn * (cls.T_BR - 1.0) / cls.T_BR         # избыток на продажу/запас
-        eta_cascade = cls.ETA_MHD + (1.0 - cls.ETA_MHD) * cls.ETA_STEAM
+        # v46B: нижний каскад — единая формула (пар | Брайтон | Брайтон+sCO2)
+        eta_low = cls._eta_low()
+        eta_cascade = cls.ETA_MHD + (1.0 - cls.ETA_MHD) * eta_low
         P_sync_harvest = cls.SYNC_HARVEST_FRAC * max(P_sync_net_W, 0.0) * cls.SYNC_CONV_EFF
         P_electric = P_fusion_W * eta_cascade + P_sync_harvest
         # v36: честная рециркуляция — криогеника (константа) + ALIP-прокачка ~ (B·v)^2
         recirc = cls.RECIRC_FRAC
+        recirc_raw = recirc  # v41: raw-налог до клипа — телеметрия насыщения
         if B_T is not None and pump_speed is not None:
-            recirc = cls.RECIRC_CRYO_FRAC + cls.RECIRC_PUMP_FRAC * (
+            recirc_raw = cls.RECIRC_CRYO_FRAC + (1.0 - float(alignment)) * cls.RECIRC_PUMP_FRAC * (
                 (float(B_T) / cls.RECIRC_REF_B) ** 2) * (
                 (float(pump_speed) / cls.RECIRC_REF_PUMP) ** 2)
-            recirc = float(np.clip(recirc, cls.RECIRC_CRYO_FRAC, 0.12))
+            recirc = float(recirc_raw)  # v43: клип 0.12 снят — честный налог B^2*pump^2
         P_net = P_electric * (1.0 - recirc)
         return {
             "eta_cascade": eta_cascade,
             "recirc_frac": recirc,
+            "recirc_raw": recirc_raw,  # v41
             "P_electric_W": P_electric,
             "P_net_W": P_net,
             "P_sync_harvest_W": P_sync_harvest,
@@ -323,14 +437,17 @@ class GAKOptunaOptimizer:
             # 1. T > T_CAP — runaway
             if T_pred > self.T_CAP:
                 self._prescreen_stats["rejected"] += 1
+                self._prescreen_last_reason = f"T_pred={T_pred:.4e} > T_CAP={self.T_CAP:.1e} (runaway)"
                 return 'reject'
             # 2. T < 1e6 — слишком холодная, реакция не пойдёт
             if T_pred < 1e6:
                 self._prescreen_stats["rejected"] += 1
+                self._prescreen_last_reason = f"T_pred={T_pred:.4e} < 1e6 (холодная плазма)"
                 return 'reject'
             # 3. pair_rate < 1 — нет рождения пар
             if pair_rate_pred < 1.0:
                 self._prescreen_stats["rejected"] += 1
+                self._prescreen_last_reason = f"pair_rate_pred={pair_rate_pred:.4e} < 1 (нет рождения пар)"
                 return 'reject'
 
             self._prescreen_stats["passed"] += 1
@@ -339,26 +456,120 @@ class GAKOptunaOptimizer:
             self._prescreen_stats["passed"] += 1
             return None
 
+    def _prescreen_checked(self, trial, cfg):
+        """v46.7: прозрачность гейта — reject пишется в телеметрию,
+        сиды обходят фильтр (эталонные точки защищены от суррогата)."""
+        if not self.PRESCREEN_ENABLED:
+            return None  # v46C: гейт инертен по умолчанию (AutoLearn продолжает учиться)
+        # v46C FIX: двойная страховка сида — метка enqueue + ключ из trial.params
+        # (в v46B ключ строился из плоских cfg.get — всегда (0,0,0), обход был мёртв)
+        try:
+            if trial.user_attrs.get("seed"):
+                try:
+                    trial.set_user_attr("prescreen_reject", "seed_bypass")
+                except Exception:
+                    pass
+                return None
+        except Exception:
+            pass
+        _tp = getattr(trial, "params", {}) or {}
+        _efq = cfg.get("economy_flags") or {}
+        key = (round(float(_tp.get("n_density", cfg.get("n_density", 0) or 0) or 0), 3),
+               round(float(_tp.get("R_mm", cfg.get("R_mm", 0) or 0) or 0), 1),
+               round(float(_tp.get("pl_radius_mm", cfg.get("pl_radius_mm", 0) or 0) or 0), 1),
+               round(float(_tp.get("pump_speed", cfg.get("pump_speed", 0) or 0) or 0), 6),
+               round(float(_tp.get("alignment", cfg.get("alignment", 0) or 0) or 0), 4),
+               str(_tp.get("wall_material", cfg.get("wall_material", "steel") or "steel")),
+               # v46Q: флаги в ключе прескрина — синхронно с _pkey
+               bool(_tp.get("welded_vessel", _efq.get("welded_vessel", False))),
+               bool(_tp.get("emitter", _efq.get("emitter", False))))
+        if key in getattr(self, "_seed_pkeys", set()):
+            try:
+                trial.set_user_attr("prescreen_reject", "seed_bypass")
+            except Exception:
+                pass
+            return None
+        reason = self._prescreen(cfg)
+        if reason:
+            try:
+                trial.set_user_attr("prescreen_reject",
+                                    getattr(self, "_prescreen_last_reason", "reject"))
+            except Exception:
+                pass
+        return reason
+
+    def _active_bounds(self):
+        """v44: границы зависят от режима. В lcoe окно R расширено — размер
+        становится ручкой экономики (стенку разбавляют радиусом)."""
+        # v45R: override снят — реалистичное окно живёт в самих BOUNDS
+        return dict(self.BOUNDS)
+
+    def _suggest_alignment(self, trial):
+        """v46A: выравнивание прокачки. FixedTrial без ключа -> 0.0 (старая физика,
+        обратная совместимость _refine_top/_staged_validate); живой Trial -> TPE."""
+        if "alignment" in getattr(trial, "params", {}):
+            return float(trial.params["alignment"])
+        if isinstance(trial, optuna.trial.FixedTrial):
+            return 0.0
+        return trial.suggest_float("alignment", 0.0, 1.0)
+
+    def _suggest_material(self, trial):
+        """v46H: материал первой стенки. FixedTrial без ключа -> steel
+        (обратная совместимость сидов/валидации); живой Trial -> TPE."""
+        if "wall_material" in getattr(trial, "params", {}):
+            return str(trial.params["wall_material"])
+        if isinstance(trial, optuna.trial.FixedTrial):
+            return "steel"
+        return trial.suggest_categorical("wall_material", ["steel", "tpg", "c_c_sic", "c_c_sic_adv"])  # v46L: +adv
+
+    def _suggest_flag(self, trial, name):
+        """v46Q: экономические флаги (welded_vessel/emitter). FixedTrial без ключа
+        -> False (обратная совместимость сидов/валидации); живой Trial -> TPE."""
+        if name in getattr(trial, "params", {}):
+            return bool(trial.params[name])
+        if isinstance(trial, optuna.trial.FixedTrial):
+            return False
+        return bool(trial.suggest_categorical(name, [False, True]))
+
     def _build_trial_config(self, trial):
         """Конфиг из trial. Constraint: pl_radius < R_mm * 0.5."""
         cfg = dict(self.base_config)
 
-        R_mm = trial.suggest_float("R_mm", *self.BOUNDS["R_mm"])
+        R_mm = trial.suggest_float("R_mm", *self._active_bounds()["R_mm"])  # v44
         h_mm = trial.suggest_float("h_mm", *self.BOUNDS["h_mm"])
         T_inner = trial.suggest_float("T_inner", *self.BOUNDS["T_inner"])
         T_outer = trial.suggest_float("T_outer", *self.BOUNDS["T_outer"])
         k_thermal = trial.suggest_float("k_thermal", *self.BOUNDS["k_thermal"])
 
         # v21: Constraint: плазма внутри сферы (золотая зона + safety)
-        pl_radius_lo = max(R_mm * 0.42, 500)
-        pl_radius_hi = min(R_mm * 0.52, 620)
-        if pl_radius_hi <= pl_radius_lo:
-            pl_radius_hi = pl_radius_lo + 10.0  # safety: never flip
-        pl_radius_mm = trial.suggest_float("pl_radius_mm",
-                                           pl_radius_lo,
-                                           pl_radius_hi)
-        T_plasma = trial.suggest_float("T_plasma_init", *self.BOUNDS["T_plasma_init"], log=True)
-        n_density = trial.suggest_float("n_density", *self.BOUNDS["n_density"], log=True)
+        if self.mode == "lcoe":
+            # v46Q: СТАТИЧНАЯ СИГНАТУРА TPE — pl/n едины для всех триалов, сиды
+            # и разведка в одной группе joint-модели (лечение ямы разведки).
+            # Ограничения (золотая зона, Гринвальд) — гейтами в objective_ignition.
+            pl_radius_mm = trial.suggest_float("pl_radius_mm", 500.0, 2600.0)
+            T_plasma = trial.suggest_float("T_plasma_init", *self.BOUNDS["T_plasma_init"], log=True)
+            external_B = trial.suggest_float("external_B", *self.BOUNDS["external_B"])  # v46Q: ось до 15 Тл
+            n_density = trial.suggest_float("n_density", 1e20, 3.6e21, log=True)
+            welded_vessel = self._suggest_flag(trial, "welded_vessel")  # v46Q
+            emitter = self._suggest_flag(trial, "emitter")              # v46Q
+            cfg["economy_flags"] = {"welded_vessel": welded_vessel, "emitter": emitter}
+        else:
+            pl_radius_lo = max(R_mm * 0.42, 500)
+            pl_radius_hi = R_mm * 0.52  # v45R: кламп 620 снят — реалистичная геометрия
+            if pl_radius_hi <= pl_radius_lo:
+                pl_radius_hi = pl_radius_lo + 10.0  # safety: never flip
+            pl_radius_mm = trial.suggest_float("pl_radius_mm",
+                                               pl_radius_lo,
+                                               pl_radius_hi)
+            T_plasma = trial.suggest_float("T_plasma_init", *self.BOUNDS["T_plasma_init"], log=True)
+            external_B = trial.suggest_float("external_B", *self.BOUNDS["external_B"])  # v45R.2: ДО Гринвальда (FIX UnboundLocalError)
+            # v45R: external_B предлагается ДО плотности — потолок Гринвальда зависит от B и a
+            # v45R: динамический потолок плотности: n <= 0.8 * n_G(B, a), a — малый радиус плазмы
+            _a_m = pl_radius_mm / 1000.0
+            _n_G = self.greenwald_limit(external_B, _a_m)
+            _n_hi = min(self.BOUNDS["n_density"][1], 0.8 * _n_G) if np.isfinite(_n_G) else self.BOUNDS["n_density"][1]
+            _n_hi = max(_n_hi, self.BOUNDS["n_density"][0] * 1.2)  # safety: не вырождать окно
+            n_density = trial.suggest_float("n_density", self.BOUNDS["n_density"][0], _n_hi, log=True)
 
         # v9.1: D-T зафиксирован
         fuel_idx = self.FIXED_FUEL_IDX
@@ -368,7 +579,8 @@ class GAKOptunaOptimizer:
         pump_speed = trial.suggest_float("pump_speed", *self.BOUNDS["pump_speed"], log=True)
         E_field = trial.suggest_float("E_field", *self.BOUNDS["E_field"], log=True)
         gap_nm = trial.suggest_int("gap_nm", *self.BOUNDS["gap_nm"])
-        external_B = trial.suggest_float("external_B", *self.BOUNDS["external_B"])
+        alignment = self._suggest_alignment(trial)  # v46A
+        wall_material = self._suggest_material(trial)  # v46H
 
         R_m = R_mm / 1000
         h_m = h_mm / 1000
@@ -400,6 +612,8 @@ class GAKOptunaOptimizer:
             **self.base_config.get("vacuum_monitor", {}),
             "P_initial": P_initial,
             "pump_speed": pump_speed,
+            "alignment": alignment,  # v46A
+            "wall_material": wall_material,  # v46H
         }
         cfg["quantum_vacuum"] = {
             **self.base_config.get("quantum_vacuum", {}),
@@ -417,7 +631,7 @@ class GAKOptunaOptimizer:
         cfg = dict(self.base_config)
 
         if phase == 'ignition':
-            bounds = self.IGNITION_BOUNDS
+            bounds = self._active_bounds() if self.mode == "lcoe" else self.IGNITION_BOUNDS  # v44
             # Все параметры свободны
             R_mm = trial.suggest_float("R_mm", *bounds["R_mm"])
             h_mm = trial.suggest_float("h_mm", *bounds["h_mm"])
@@ -425,19 +639,25 @@ class GAKOptunaOptimizer:
             T_outer = trial.suggest_float("T_outer", *bounds["T_outer"])
             k_thermal = trial.suggest_float("k_thermal", *bounds["k_thermal"])
             pl_radius_lo = max(R_mm * 0.42, 500)
-            pl_radius_hi = min(R_mm * 0.52, 620)
+            pl_radius_hi = R_mm * 0.52  # v45R: кламп 620 снят — реалистичная геометрия
             if pl_radius_hi <= pl_radius_lo:
                 pl_radius_hi = pl_radius_lo + 10.0  # safety: never flip
             pl_radius_mm = trial.suggest_float("pl_radius_mm",
                                                 pl_radius_lo,
                                                 pl_radius_hi)
             T_plasma = trial.suggest_float("T_plasma_init", *bounds["T_plasma_init"], log=True)
-            n_density = trial.suggest_float("n_density", *bounds["n_density"], log=True)
+            # v45R: external_B до плотности — динамический потолок Гринвальда
             external_B = trial.suggest_float("external_B", *bounds["external_B"])
+            _a_m = pl_radius_mm / 1000.0
+            _n_G = self.greenwald_limit(external_B, _a_m)
+            _n_hi = min(bounds["n_density"][1], 0.8 * _n_G) if np.isfinite(_n_G) else bounds["n_density"][1]
+            _n_hi = max(_n_hi, bounds["n_density"][0] * 1.2)
+            n_density = trial.suggest_float("n_density", bounds["n_density"][0], _n_hi, log=True)
             gap_nm = trial.suggest_int("gap_nm", *bounds["gap_nm"])
             E_field = trial.suggest_float("E_field", *bounds["E_field"], log=True)
             P_initial = trial.suggest_float("P_initial", *bounds["P_initial"], log=True)
             pump_speed = trial.suggest_float("pump_speed", *bounds["pump_speed"], log=True)
+            alignment = self._suggest_alignment(trial)  # v46A
         elif phase == 'burn':
             # Общие параметры — из shared_params (топ-N из Phase 1)
             # Фаза-специфичные — свободны в узком окне
@@ -451,12 +671,13 @@ class GAKOptunaOptimizer:
             n_density = shared_params["n_density"]
             external_B = shared_params["external_B"]
             gap_nm = int(shared_params["gap_nm"])
+            alignment = float(shared_params.get("alignment", 0.0))  # v46A: геометрия общая
 
             # Фаза-специфичные — горение (низкий E_field, низкое P)
             w = self.BURN_BOUNDS_WIDTH
             e_lo, e_hi = 1e16, 5e17   # НИЗКИЙ E_field для горения
             p_lo, p_hi = 1e-4, 1.0    # НИЗКОЕ давление
-            ps_lo, ps_hi = 1e-3, 0.15  # v37
+            ps_lo, ps_hi = 1e-3, 0.22  # v43  # v42: 0.18->0.20 (синхрон с BOUNDS)
 
             E_field = trial.suggest_float("E_field_burn", e_lo, e_hi, log=True)
             P_initial = trial.suggest_float("P_initial_burn", p_lo, p_hi, log=True)
@@ -499,6 +720,7 @@ class GAKOptunaOptimizer:
             **self.base_config.get("vacuum_monitor", {}),
             "P_initial": P_initial,
             "pump_speed": pump_speed,
+            "alignment": alignment,  # v46A
         }
         cfg["quantum_vacuum"] = {
             **self.base_config.get("quantum_vacuum", {}),
@@ -636,16 +858,29 @@ class GAKOptunaOptimizer:
                     R_burn_rep = recent_p / E_fus_rep if E_fus_rep > 0 else 0.0
                     pump_rep = float(cfg.get("vacuum_monitor", {}).get(
                         "pump_speed", self.RECIRC_REF_PUMP))
+                    align_rep = float(cfg.get("vacuum_monitor", {}).get("alignment", 0.0))  # v46A
                     f_He_rep = min(self.F_HE_MAX, self.C_ASH * R_burn_rep /
                                    max(n_density * V_plasma * pump_rep, 1e-30))
                     P_net_rep = recent_p * (1.0 - f_He_rep) ** 2
                     P_elec_rep = P_net_rep * (self.ETA_MHD +
-                                              (1.0 - self.ETA_MHD) * self.ETA_STEAM)
-                    recirc_rep = self.RECIRC_CRYO_FRAC + self.RECIRC_PUMP_FRAC * \
+                                              (1.0 - self.ETA_MHD) * self._eta_low())  # v46B FIX: был жёсткий ETA_STEAM
+                    recirc_rep = self.RECIRC_CRYO_FRAC + (1.0 - align_rep) * self.RECIRC_PUMP_FRAC * \
                         (external_B / self.RECIRC_REF_B) ** 2 * \
                         (pump_rep / self.RECIRC_REF_PUMP) ** 2
-                    recirc_rep = float(np.clip(recirc_rep, self.RECIRC_CRYO_FRAC, 0.12))
-                    trial.report(-P_elec_rep * (1.0 - recirc_rep), step_i)
+                    recirc_rep = float(recirc_rep)  # v43: клип снят — честный налог
+                    # v46G: охрана зажигания — P_elec_rep < 1e6 Вт => конфигурация
+                    # не зажглась (trial 34 run9: value -0.0 при last_intermediate
+                    # -1.026e-18). Сентинел 1e10 вместо шума: value-колонка читается,
+                    # Best-парсер не травится, прунер добивает мусор сразу.
+                    if P_elec_rep < 1e6:
+                        trial.report(1e10, step_i)
+                        trial.set_user_attr("last_intermediate", 1e10)
+                        trial.set_user_attr("no_ignition", True)
+                    else:
+                        p_net_step = -P_elec_rep * (1.0 - recirc_rep)  # текущее значение шага
+                        trial.report(p_net_step, step_i)
+                        trial.set_user_attr("last_intermediate", p_net_step)  # v40: телеметрия Дипа
+
                     if trial.should_prune():
                         raise optuna.TrialPruned()
 
@@ -757,7 +992,8 @@ class GAKOptunaOptimizer:
                 "avg_P_sync_W": avg_P_sync_W,
                 "station": self._station_balance(avg_P_fusion_W, avg_P_sync_W,
                                                  B_T=external_B,
-                                                 pump_speed=cfg["vacuum_monitor"].get("pump_speed", self.RECIRC_REF_PUMP)),
+                                                 pump_speed=cfg["vacuum_monitor"].get("pump_speed", self.RECIRC_REF_PUMP),
+                                                 alignment=cfg["vacuum_monitor"].get("alignment", 0.0)),  # v46A
             }
 
         except optuna.TrialPruned:
@@ -924,7 +1160,9 @@ class GAKOptunaOptimizer:
                 # Pruner
                 if trial is not None and step_i in report_steps and len(Q_vals) > 0:
                     recent_q = float(np.mean(Q_vals[-max(1, len(Q_vals)//10):]))
-                    trial.report(-recent_q, step_i)
+                    q_step = -recent_q  # текущее значение шага
+                    trial.report(q_step, step_i)
+                    trial.set_user_attr("last_intermediate", q_step)  # v40: телеметрия Дипа
                     if trial.should_prune():
                         raise optuna.TrialPruned()
 
@@ -1064,7 +1302,10 @@ class GAKOptunaOptimizer:
         def callback(study, trial):
             try:
                 best_val = study.best_value if study.best_value is not None else 0
-                if self.mode != "pareto" and best_val != 0:
+                if self.mode == "lcoe" and best_val not in (None, 0, 1e10):
+                    progress = (trial.number + 1) / total_trials
+                    st.write(f"Trial {trial.number + 1}/{total_trials} | Best LCOE={best_val:.1f} $/МВт·ч")
+                elif self.mode != "pareto" and best_val != 0:
                     progress = (trial.number + 1) / total_trials
                     st.write(f"Trial {trial.number + 1}/{total_trials} | Best P={-best_val/1e6:.2f} MW")
                 else:
@@ -1073,11 +1314,52 @@ class GAKOptunaOptimizer:
                 pass
         return callback
 
-    def optimize(self, mode: str, n_trials: int = 50,
+    def _save_training_dataset(self):
+        """v44: автосохранение датасета после прогона. COMPLETE и PRUNED-триалы
+        мерджатся в models/training_dataset.csv по ключу (study, number) —
+        экспорт и обучающая выборка больше никогда не расходятся."""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            os.makedirs(os.path.join(script_dir, "models"), exist_ok=True)
+            path = os.path.join(script_dir, "models", "training_dataset.csv")
+            import csv as _csv
+            rows = {}
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    for r in _csv.DictReader(f):
+                        rows[(r.get("study"), r.get("number"))] = r
+            for t in self.study.get_trials(deepcopy=False):
+                if t.state not in (optuna.trial.TrialState.COMPLETE,
+                                   optuna.trial.TrialState.PRUNED):
+                    continue
+                row = {"study": self.study.study_name, "number": str(t.number),
+                       "state": t.state.name, "physics": "v46Q", "mode": self.mode}
+                if t.value is not None:
+                    row["value"] = t.value
+                row.update({f"param_{k}": v for k, v in (t.params or {}).items()})
+                row.update({f"attr_{k}": v for k, v in (t.user_attrs or {}).items()})
+                rows[(row["study"], row["number"])] = row
+            fieldnames = sorted({k for r in rows.values() for k in r})
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = _csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for r in rows.values():
+                    w.writerow(r)
+            print(f"[Dataset] training_dataset.csv: {len(rows)} записей (physics=v46Q)")
+        except Exception as e:
+            print(f"[Dataset] save error: {e}")
+
+    def optimize(self, mode: str = None, n_trials: int = 80,   # v39: 50->80; v45R: None -> lcoe
                  use_surrogate: bool = False,
                  surrogate_trials: int = 500,
                  refine_top: int = 10):
+        mode = mode or "lcoe"  # v45R: LCOE по умолчанию
         self.mode = mode
+        # v46O: ось B — расширение external_B ТОЛЬКО в lcoe
+        # (ignition/gain/pareto/каскад живут на прежнем окне 10–13 Тл).
+        # v46Q: до 15 Тл — S32/S33 диагностируют показатель d в P ~ B^d.
+        if mode == "lcoe":
+            self.BOUNDS = dict(self.BOUNDS, external_B=(10.0, 15.0))
         self._pruned_count = 0
 
         # v11.5: автозагрузка предиктора, если не установлен
@@ -1118,16 +1400,24 @@ class GAKOptunaOptimizer:
                     print(f"[AutoLearn] Fallback failed: {e2}")
 
         # v11: MedianPruner — отсекает плохие trials на ранних шагах
-        # v36: судья не трогает триал на разогреве — warmup = 50% прогона
+        # v36: судья не трогает триал на разогреве; v42: warmup = 65% прогона
+        # v46G: SeedAwarePruner — медиана ТОЛЬКО по не-сидовым COMPLETE: сиды —
+        #       эталоны, а не планка (run9: 40/50 PRUNED, разведка без финишеров)
         base_steps = int(self.base_config.get("simulation", {}).get("n_steps", 2500000))
-        pruner = optuna.pruners.MedianPruner(
+        pruner = SeedAwarePruner(
             n_startup_trials=10,                    # первые 10 не прерывать
-            n_warmup_steps=int(0.5 * base_steps),   # первые 50% шагов — разогрев плазмы
+            n_warmup_steps=int(0.65 * base_steps),  # v42: 50%->65% — гигиена прунера, выборка плотнее
             interval_steps=max(1, base_steps // 20),
             n_min_trials=3,                         # не судить по 1–2 точкам
         )
+        # v46O (перенос из v46N): NopPruner в lcoe — пруннутые с отрицательным
+        # last_intermediate (-9.6e7...-4.4e8) попадали в below-множество TPE
+        # как "чемпионы" (run16: 71 из 83). Run17 (NopPruner): PRUNED=0, все
+        # COMPLETE. Сиды не прунятся и так; ignition/gain/pareto — SeedAware.
+        if mode == "lcoe":
+            pruner = optuna.pruners.NopPruner()
 
-        study_name = f"gak_opt_{mode}"
+        study_name = f"gak_opt_{mode}_v46Q"  # v46Q: флаги экономики + B=15 + статичная сигнатура + гейты
         if mode == "pareto":
             self.study = optuna.create_study(
                 directions=["maximize", "maximize"],
@@ -1182,21 +1472,396 @@ class GAKOptunaOptimizer:
             "E_field": 5.772087101959802e17, "gap_nm": 1,
             "external_B": 28.72838584704643,
         }
-        # v37: рекорд 1527 МВт — разведка (1.6e21, 615) на базе SEED_PARAMS_4
+        # v39: чемпион v37.2 (trial 37: 597.24 МВт net) — старт из новой долины
+        SEED_PARAMS_6 = {
+            "R_mm": 1205.8618926411255, "h_mm": 12.302061995307,
+            "T_inner": 379.3506434254803, "T_outer": 293.89135499073126,
+            "k_thermal": 39.2815985066004, "pl_radius_mm": 616.1902130761636,
+            "T_plasma_init": 123126866.94048074, "n_density": 2.0734839105972158e21,
+            "P_initial": 0.06788464581116989, "pump_speed": 0.1440353424694812,
+            "E_field": 5.5629162289043616e17, "gap_nm": 2,
+            "external_B": 28.48095578305144,
+        }
+        # v37: рекорд 1527 МВт — разведка (2.2e21, 615) на базе SEED_PARAMS_4
         SEED_PARAMS_5 = dict(SEED_PARAMS_4)
-        SEED_PARAMS_5["n_density"] = 1.6e21
+        SEED_PARAMS_5["n_density"] = 3.0e21  # v41: разведка на новом потолке (2.6 -> 3.0)
         SEED_PARAMS_5["pl_radius_mm"] = 615.0
         def _probe_n(base, n_new, pl_new=None):
             p = dict(base); p["n_density"] = n_new
             if pl_new is not None: p["pl_radius_mm"] = pl_new
             return p
-        queued_cfgs = [BEST_SEED_PARAMS, SEED_PARAMS_2, SEED_PARAMS_3,
-                       SEED_PARAMS_4, SEED_PARAMS_5,
-                       _probe_n(SEED_PARAMS_4, 1.55e21, 615.0)]
+        # v41: чемпион v40 — trial 79 (1388.54 МВт net), первым в очереди
+        SEED_PARAMS_7 = {
+            "R_mm":           1196.4097311434175,
+            "h_mm":           10.89644647097812,
+            "T_inner":        388.4089122831374,
+            "T_outer":        286.6778738247287,
+            "k_thermal":      26.63317557121712,
+            "pl_radius_mm":   616.1558096833119,
+            "T_plasma_init":  130575281.82843617,
+            "n_density":      2.336991641190688e+21,
+            "P_initial":      0.1275864939496372,
+            "pump_speed":     0.1700226148976479,
+            "E_field":        5.0263975275730464e+17,
+            "gap_nm":         1,
+            "external_B":     30.379590947908213,
+        }
+        # v42: сиды — теневой чемпион v41 (trial 73: raw 2060.6 МВт, beta 0.1268)
+        SEED_PARAMS_8 = {
+            "R_mm":           1182.5697351317338,
+            "h_mm":           12.818797906477275,
+            "T_inner":        416.0718688935157,
+            "T_outer":        299.7381203205847,
+            "k_thermal":      26.936828269043488,
+            "pl_radius_mm":   607.9276441094855,
+            "T_plasma_init":  122644349.40333551,
+            "n_density":      2.998470399013456e+21,
+            "P_initial":      0.14631206124824597,
+            "pump_speed":     0.15804003080267592,
+            "E_field":        4.554029583448481e+17,
+            "gap_nm":         3,
+            "external_B":     33.76542305716652,
+        }
+        # v42: официальный чемпион v41 (trial 70: 1838.60 МВт net, beta 0.1140)
+        SEED_PARAMS_9 = {
+            "R_mm":           1189.5816795080914,
+            "h_mm":           13.211449882412893,
+            "T_inner":        419.12438355867016,
+            "T_outer":        298.76996571985524,
+            "k_thermal":      25.362521544543014,
+            "pl_radius_mm":   616.2750488333286,
+            "T_plasma_init":  122132463.5063297,
+            "n_density":      2.852246398685251e+21,
+            "P_initial":      0.08536927348431113,
+            "pump_speed":     0.12219790380357026,
+            "E_field":        4.327347925931941e+17,
+            "gap_nm":         3,
+            "external_B":     34.22039648428221,
+        }
+        # v43: чемпион прогона 01.11 (trial 31: 2419.50 МВт net при честном налоге)
+        SEED_PARAMS_CHAMP43 = {
+            "R_mm":           1192.4697953863817,
+            "h_mm":           13.07100550538681,
+            "T_inner":        413.54675585272474,
+            "T_outer":        297.4151485918359,
+            "k_thermal":      36.83919923086654,
+            "pl_radius_mm":   609.7902584076783,
+            "T_plasma_init":  113513494.03030033,
+            "n_density":      3.4287805241632217e+21,
+            "P_initial":      0.05474568408859994,
+            "pump_speed":     0.12422406344336229,
+            "E_field":        5.480526598115344e+17,
+            "gap_nm":         3,
+            "external_B":     34.7907691255818,
+        }
+        # v45R: сиды S1–S5 — точки реалистичного окна (B 10–13 Тл, R 1.2–5.5 м).
+        # n каждого = 0.78*n_G(B, a) — под динамическим потолком Гринвальда.
+        # S5 — скаут жёсткого лимита стенки (ожидаем reject 1e10).
+        _S_BASE = {
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "k_thermal": 36.84, "T_plasma_init": 1.135e8,
+            "P_initial": 0.0547, "pump_speed": 0.18, "gap_nm": 1,
+            "alignment": 0.0,  # v46A: смоук — эталонная физика
+        }
+        def _nG(B_T, a_m):
+            I_p = 2.0 * np.pi * a_m * B_T / (self.MU0 * self.SAFETY_Q)
+            return (I_p / 1e6) * 1e20 / (np.pi * a_m * a_m)
+        def _seed_v45R(B_T, R_mm_, wall_MW):
+            # v45R.2: сиды под стенку — закон смоука wall = 2.86e-35 * n^2 * R (R в м)
+            a_m = R_mm_ * 0.52 / 1000.0
+            R_m = R_mm_ / 1000.0
+            n_wall = (wall_MW * 1e6 / (2.86e-35 * R_m)) ** 0.5
+            return {**_S_BASE, "R_mm": R_mm_, "pl_radius_mm": R_mm_ * 0.52,
+                    "external_B": B_T, "E_field": 1.2e16 * B_T,
+                    "n_density": min(0.78 * _nG(B_T, a_m), n_wall)}
+        # v46K ЭТАЛОНЫ (пер-м² экономика; сверено по телеметрии run10/run13):
+        #   S1(steel) = 115.1209736869   S2(steel) = 113.4016484507
+        #   S3(steel) = 116.1618391886   S4(steel) = 124.7048229193
+        #   S5(tpg)   = 113.4624627723   S6(steel) = 119.8067081467
+        #   S7(steel) = 118.8687251815   S8(tpg)   = 104.5177472990
+        #   S9(steel) = 114.8494689433409  S10(steel) = 114.7058633245
+        #   S11(steel) = 113.7473154999 — лидер стального кластера
+        #   S12(c_c_sic) = 100.6447775801 — ПРОБОЙ СОТНИ (run13, бит в бит)
+        #   S13(c_c_sic) = 99.5891013901 — ЧЕМПИОН, сотня пробита (run14, бит в бит)'
+        #   S14(c_c_sic) = 106.1617 честный (raw 97.1828) — ось плотности Дипсика
+        #   S15/S16/S17(c_c_sic) = 103.7786 / 112.5979 / 122.2686 честные
+        #     (сырые 98.5391 / 97.4948 / 96.4563 покупались багом беты)
+        #   S18-S21(c_c_sic) = R=2500/2400/2300/2200 при n=5.309272075653e20
+        #     (beta=0.149 на R=2500) — честная цепочка по потолку беты
+        queued_cfgs = [_seed_v45R(12.0, 4300.0, 11.5),   # S1: под стенку (~11.5 МВт/м2)
+                       _seed_v45R(11.0, 4000.0, 11.5),   # S2
+                       _seed_v45R(12.5, 4600.0, 11.5),   # S3
+                       _seed_v45R(13.0, 5000.0, 10.0),   # S4: дорого по магнитам
+                       {**_seed_v45R(12.0, 3000.0, 12.5), "wall_material": "tpg"},  # S5: скаут градиента; v46H: tpg
+                       {  # v46B: S6 — сид-инъекция чемпиона v46A (trial 42 run3,
+                          # LCOE 117.63346736636007); параметры бит в бит из
+                          # trials_v46A_run3_0611.csv — детерминизм проверяем бесплатно
+                           "R_mm": 4663.101166321131,
+                           "h_mm": 13.820513241074568,
+                           "T_inner": 408.4747743556464,
+                           "T_outer": 298.997129811904,
+                           "k_thermal": 40.59063349797366,
+                           "pl_radius_mm": 2193.9017773960154,
+                           "T_plasma_init": 111794542.46325402,
+                           "n_density": 3.247011140181622e+20,
+                           "P_initial": 0.06061075445994368,
+                           "pump_speed": 0.042368363394085964,
+                           "E_field": 1.350090861403684e+17,
+                           "gap_nm": 5,
+                           "external_B": 11.266935972986923,
+                           "alignment": 0.39134355828674217},
+                       {  # v46D.1: S7 — чемпион S6 с alignment=0.0 (контрфакт 46.8:
+                          # TPE не дошёл до близнеца без покрытий). Эталон
+                          # 115.00129928973597 — проверяем седьмой тест детерминизма
+                           "R_mm": 4663.101166321131,
+                           "h_mm": 13.820513241074568,
+                           "T_inner": 408.4747743556464,
+                           "T_outer": 298.997129811904,
+                           "k_thermal": 40.59063349797366,
+                           "pl_radius_mm": 2193.9017773960154,
+                           "T_plasma_init": 111794542.46325402,
+                           "n_density": 3.247011140181622e+20,
+                           "P_initial": 0.06061075445994368,
+                           "pump_speed": 0.042368363394085964,
+                           "E_field": 1.350090861403684e+17,
+                           "gap_nm": 5,
+                           "external_B": 11.266935972986923,
+                           "alignment": 0.0},
+                       {**_seed_v45R(13.0, 3000.0, 16.5), "wall_material": "tpg"},  # v46E: S8 — скаут алмазной зоны; v46H: tpg
+                       {  # v46F: S9 = trial 31 run8 (115.6080) с alignment=0.0 —
+                          # TPE держал 114.8494689433 и отдал 0.7585 за alignment-налог;
+                          # параметры бит в бит из trials_v46E_run8_0811.csv
+                            "R_mm": 4443.387577294695,
+                            "h_mm": 14.675611588292389,
+                            "T_inner": 419.4893243763244,
+                            "T_outer": 297.7580834037615,
+                            "k_thermal": 45.94708170333445,
+                            "pl_radius_mm": 2178.4462037748535,
+                            "T_plasma_init": 110086487.93450329,
+                            "n_density": 3.2832237206200235e+20,
+                            "P_initial": 0.05852128706978756,
+                            "pump_speed": 0.041928387027360695,
+                            "E_field": 1.2159635818550267e+17,
+                            "gap_nm": 5,
+                            "external_B": 11.641362497595981,
+                            "alignment": 0.0},
+                       {**_seed_v45R(12.0, 4300.0, 11.5),  # v46F: S10 = S1 с al=0.26 —
+                        "alignment": 0.26},                # закрытие 46.8 на высоком насосе
+        ]
+        # v46G: СИД S11 = S9 с pump_speed=0.06 — сид-проба рекомендации Дипсика №3
+        # ("дать больше откачки"). Физика от насоса меняется => эталона нет,
+        # репорт-точка. Ожидание по run8 (trial 33, pump=0.066): чуть хуже S9 (~114.9).
+        queued_cfgs.append({**queued_cfgs[8], "pump_speed": 0.06})
+        # v46K: СИД S12 = S8, сжатый до R=2600 — скаут зоны C/C-SiC (ТЗ Дипсика).
+        # n ∝ 1/R, pl ∝ R; стенка ~17.6 МВт/м2 — зона доступна только композиту.
+        # Параметры — литералы бит в бит из run13 (v46J): эталон 100.6447775801,
+        # пробой сотни подтверждён run13.
+        queued_cfgs.append({
+            "R_mm": 2600.0, "pl_radius_mm": 1352.0, "external_B": 13.0,
+            "n_density": 5.05995011135e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        # v46K: СИД S13 = S12, сжатый до R=2500 — репорт-точка нижнего края
+        # композитной зоны. n = 5.262348115804e20 (продолжение ∝1/R),
+        # pl=1300, стенка ~18.35 МВт/м2 (масштаб от измеренных 17.64 у S12):
+        # выше лимита TPG (18), под потолком C/C-SiC (22). Эталон 99.5891013901 — run14.
+        queued_cfgs.append({
+            "R_mm": 2500.0, "pl_radius_mm": 1300.0, "external_B": 13.0,
+            "n_density": 5.262348115804e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        # v46L: СИД S14 — ось плотности (ТЗ Дипсика): R=2500, n=5.5e20 (доля
+        # Гринвальда 0.691), проверка растёт ли P_net при подкачке плотности.
+        # run15 честно: raw 97.1828, честный 106.1617 (бета 0.1568 > 0.15):
+        # выигрыш дал тритиевый кредит opex_T, не мощность. Репорт-точка.
+        queued_cfgs.append({
+            "R_mm": 2500.0, "pl_radius_mm": 1300.0, "external_B": 13.0,
+            "n_density": 5.5e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        # v46L: СИДЫ S15/S16/S17 — тренд сжатия к нижнему краю композитной
+        # зоны: R=2400/2300/2200, n ∝ 1/R от S13 (доля 0.6613 сохраняется),
+        # pl = 0.52*R. Стенки ~19.0/19.9/20.8 — под потолком c_c_sic (22).
+        # Run15 честно: S15=103.7786, S16=112.5979, S17=122.2686 — сырое сжатие
+        # покупалось багом беты. Репорт-точки честного тренда.
+        queued_cfgs.append({
+            "R_mm": 2400.0, "pl_radius_mm": 1248.0, "external_B": 13.0,
+            "n_density": 5.481612620629e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 2300.0, "pl_radius_mm": 1196.0, "external_B": 13.0,
+            "n_density": 5.719943604135e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 2200.0, "pl_radius_mm": 1144.0, "external_B": 13.0,
+            "n_density": 5.979941040686e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        # v46M: СИДЫ S18-S21 — цепочка ПО ПОТОЛКУ БЕТЫ: R=2500/2400/2300/2200
+        # при постоянной n=5.309272075653e+20 (beta=0.149 на R=2500, intercept
+        # падает с R). Ошибка v46L исправлена: сжатие при постоянной плотности,
+        # pl=0.52*R. Стенки 18.6/17.9/17.2/16.5 — под потолком c_c_sic (22).
+        # Репорт-точки честного тренда (ожидания по сырому тренду ~99.1 и ниже,
+        # но честное улучшение скромнее — P_net падает с R при постоянной n).
+        queued_cfgs.append({
+            "R_mm": 2500.0, "pl_radius_mm": 1300.0, "external_B": 13.0,
+            "n_density": 5.309272075653e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 2400.0, "pl_radius_mm": 1248.0, "external_B": 13.0,
+            "n_density": 5.309272075653e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 2300.0, "pl_radius_mm": 1196.0, "external_B": 13.0,
+            "n_density": 5.309272075653e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 2200.0, "pl_radius_mm": 1144.0, "external_B": 13.0,
+            "n_density": 5.309272075653e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        # v46O: СИДЫ S22–S26 — хребет кромки беты при B=13. Литералы бит в бит
+        # из run17 (v46N-прогон): S25=96.6557 чемпион, S26 (Дипсик)=101.008.
+        queued_cfgs.append({
+            "R_mm": 2600.0, "pl_radius_mm": 1352.0, "external_B": 13.0,
+            "n_density": 5.255653e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 2700.0, "pl_radius_mm": 1404.0, "external_B": 13.0,
+            "n_density": 5.201668e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 2800.0, "pl_radius_mm": 1456.0, "external_B": 13.0,
+            "n_density": 5.147682e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 3000.0, "pl_radius_mm": 1560.0, "external_B": 13.0,
+            "n_density": 5.039711e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 2800.0, "pl_radius_mm": 1456.0, "external_B": 13.0,
+            "n_density": 5.309272075653e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        # v46O: СИД S27 — ось B: R=2500, B=14, n=6.10e20, c_c_sic_adv
+        # (реванш adv: в run16 умер в яме зажигания, не от наценки). Стенка
+        # ~24.6 при потолке 25, доля Гринвальда 0.711. Ожидание 93–96;
+        # главный вопрос — сдвиг T_eq при B=14 (синхротрон ~ B^2).
+        queued_cfgs.append({
+            "R_mm": 2500.0, "pl_radius_mm": 1300.0, "external_B": 14.0,
+            "n_density": 6.10e+20, "E_field": 1.68e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic_adv"})
+        # v46O: СИДЫ S28/S29 — плато хребта B=13: плотность прижата кэпом
+        # 0.8*n_G (доля ровно 0.8). Диагностика точки перегиба R~3300.
+        queued_cfgs.append({
+            "R_mm": 3400.0, "pl_radius_mm": 1768.0, "external_B": 13.0,
+            "n_density": 4.681e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        queued_cfgs.append({
+            "R_mm": 3600.0, "pl_radius_mm": 1872.0, "external_B": 13.0,
+            "n_density": 4.421e+20, "E_field": 1.56e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic"})
+        # v46Q: СИДЫ S30–S35 — эталоны run19 + ось B=15 + контроли флагов
+        queued_cfgs.append({
+            "R_mm": 2600.0, "pl_radius_mm": 1352.0, "external_B": 14.0,
+            "n_density": 5.95e+20, "E_field": 1.68e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic_adv"})                                   # S30 = run19: 93.9327
+        queued_cfgs.append({
+            "R_mm": 2700.0, "pl_radius_mm": 1404.0, "external_B": 14.0,
+            "n_density": 5.86e+20, "E_field": 1.68e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic_adv"})                                   # S31 = run19: 93.7031
+        queued_cfgs.append({
+            "R_mm": 2700.0, "pl_radius_mm": 1404.0, "external_B": 15.0,
+            "n_density": 5.86e+20, "E_field": 1.80e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic_adv"})                                   # S32: ось B=15, диагностика d
+        queued_cfgs.append({
+            "R_mm": 2900.0, "pl_radius_mm": 1508.0, "external_B": 15.0,
+            "n_density": 5.66e+20, "E_field": 1.80e+17,
+            "P_initial": 0.0547, "pump_speed": 0.06, "alignment": 0.0,
+            "h_mm": 13.07, "T_inner": 413.55, "T_outer": 297.42,
+            "T_plasma_init": 113500000.0, "gap_nm": 1, "k_thermal": 36.84,
+            "wall_material": "c_c_sic_adv"})                                   # S33: плато B=15
+        # контроли флагов экономики (та же физика, что S31 — различие только флагом)
+        queued_cfgs.append({**dict(queued_cfgs[30]), "welded_vessel": True})    # S34: ожидание 87.6627
+        queued_cfgs.append({**dict(queued_cfgs[30]),
+                            "welded_vessel": True, "emitter": True})            # S35: ожидание 85.9592
+        # v46M: FIX смоука (run11/run12) — сид без ключа wall_material получает
+        # steel; S5/S8 несут свой tpg, S12–S21 — c_c_sic явно.
+        for _sd in queued_cfgs:
+            _sd.setdefault("wall_material", "steel")
+            # v46Q: флаги экономики — False по умолчанию (смоук старых сидов не тронут)
+            _sd.setdefault("welded_vessel", False)
+            _sd.setdefault("emitter", False)
         def _pkey(p):
+            # v46E FIX: alignment и pump_speed в ключе — S6/S7 (близнецы по физике,
+            # но не по экономике) имели одинаковый ключ, и дедупликация молча съела
+            # S7 в run7. Теперь контрфакты проходят.
             return (round(float(p.get("n_density", 0)), 3),
                     round(float(p.get("R_mm", 0)), 1),
-                    round(float(p.get("pl_radius_mm", 0)), 1))
+                    round(float(p.get("pl_radius_mm", 0)), 1),
+                    round(float(p.get("pump_speed", 0)), 6),
+                    round(float(p.get("alignment", 0)), 4),
+                    str(p.get("wall_material", "steel")),
+                    # v46Q: флаги в ключе — иначе дедуп съел бы S34/S35
+                    bool(p.get("welded_vessel", False)),
+                    bool(p.get("emitter", False)))
         seen_params = set()
         try:
             for t in self.study.get_trials(deepcopy=False):
@@ -1206,12 +1871,24 @@ class GAKOptunaOptimizer:
                     seen_params.add(_pkey(t.params))
         except Exception:
             pass
-        for seed_params in queued_cfgs:
+        # v46B: ключи сидов для обхода гейта (46.7) + телеметрическая метка seed
+        self._seed_pkeys = {_pkey(p) for p in queued_cfgs}
+        for _si, seed_params in enumerate(queued_cfgs):
             try:
+                def _fmt(x):
+                    return f"{x:.4e}" if isinstance(x, float) else str(x)
                 if _pkey(seed_params) in seen_params:
+                    print(f"[SEED {_si+1}] ПРОПУЩЕН дедупликацией: R={_fmt(seed_params.get('R_mm'))}, "
+                          f"n={_fmt(seed_params.get('n_density'))}, al={seed_params.get('alignment')}, mat={seed_params.get('wall_material', 'steel')}")
                     continue
-                self.study.enqueue_trial(seed_params)
+                try:
+                    self.study.enqueue_trial(seed_params, user_attrs={"seed": True})
+                except TypeError:
+                    self.study.enqueue_trial(seed_params)
                 seen_params.add(_pkey(seed_params))
+                print(f"[SEED {_si+1}] в очереди: R={_fmt(seed_params.get('R_mm'))}, "
+                      f"B={_fmt(seed_params.get('external_B'))}, n={_fmt(seed_params.get('n_density'))}, "
+                      f"pump={seed_params.get('pump_speed')}, al={seed_params.get('alignment')}, mat={seed_params.get('wall_material', 'steel')}")
             except Exception:
                 pass
 
@@ -1262,10 +1939,76 @@ class GAKOptunaOptimizer:
                     print(f"[AutoLearn] Save error: {e}")
             return  # v11.3: суррогат закончен — не запускать нормальный режим
 
+        # v46O: реэнкью чемпиона — лекарство от "забывчивости" TPE. Веса
+        # наблюдений затухают с возрастом: к trial 60+ сиды были ~6%
+        # below-множества, и разведка снова позволяла себе 3.4e20. Каждые 20
+        # разведочных чемпион возвращается в очередь живой точкой.
+        _reenq = {"expl": 0, "done": 0}
+        def _reenqueue_champion(study, trial):
+            if mode != "lcoe":
+                return
+            try:
+                if (trial.user_attrs or {}).get("seed"):
+                    return
+                _reenq["expl"] += 1
+                if _reenq["expl"] % 10 != 0:  # v46Q: 20 -> 10 (в run19 клонов было мало)
+                    return
+                bt = study.best_trial
+                if bt is None:
+                    return
+                try:
+                    self.study.enqueue_trial(dict(bt.params),
+                                             user_attrs={"reenqueue": True})
+                except TypeError:
+                    self.study.enqueue_trial(dict(bt.params))
+                _reenq["done"] += 1
+                print(f"[REENQUEUE #{_reenq['done']}] чемпион trial #{bt.number} "
+                      f"(LCOE={bt.value:.4f}) в очереди — сидовое знание не выветривается")
+            except Exception as _e:
+                print(f"[REENQUEUE] skip: {_e}")
+
         def objective_ignition(trial):
             cfg = self._build_trial_config(trial)
-            if self._prescreen(cfg) == 'reject':
+            pr_reason = self._prescreen_checked(trial, cfg)
+            if pr_reason:
                 return 1e10
+            # v46Q: гейты lcoe (только не-сиды): золотая зона + жёсткий Гринвальд.
+            # pl в МЕТРАХ (урок v46P: миллиметры занижали n_G в 1000 раз и убивали всех).
+            if self.mode == "lcoe":
+                _is_seed_q = bool((trial.user_attrs or {}).get("seed", False)) or                              ("fixed_params" in getattr(trial, "system_attrs", {}))
+                if not _is_seed_q:
+                    try:
+                        _qk = (round(float(trial.params.get("n_density", 0) or 0), 3),
+                               round(float(trial.params.get("R_mm", 0) or 0), 1),
+                               round(float(trial.params.get("pl_radius_mm", 0) or 0), 1),
+                               round(float(trial.params.get("pump_speed", 0) or 0), 6),
+                               round(float(trial.params.get("alignment", 0) or 0), 4),
+                               str(trial.params.get("wall_material", "steel")),
+                               bool(trial.params.get("welded_vessel", False)),
+                               bool(trial.params.get("emitter", False)))
+                        _is_seed_q = _qk in getattr(self, "_seed_pkeys", set())
+                    except Exception:
+                        _is_seed_q = False
+                if not _is_seed_q:
+                    _gate = ""
+                    try:
+                        _Rq = float(trial.params.get("R_mm", 0) or 0)
+                        _plq = float(trial.params.get("pl_radius_mm", 0) or 0)
+                        _Bq = float(trial.params.get("external_B", 0) or 0)
+                        _nq = float(trial.params.get("n_density", 0) or 0)
+                        if _Rq > 0 and _plq > 0:
+                            _share = _plq / _Rq
+                            if not (0.42 - 1e-9 <= _share <= 0.52 + 1e-9):
+                                _gate = "golden_zone"
+                            else:
+                                _nGq = self.greenwald_limit(_Bq, _plq / 1000.0)
+                                if np.isfinite(_nGq) and _nq > _nGq:
+                                    _gate = "greenwald"
+                    except Exception:
+                        _gate = "gate_error"
+                    trial.set_user_attr("gate_reason", _gate)
+                    if _gate:
+                        return 1e10
             try:
                 m = self._run_quick(cfg, trial=trial)
             except optuna.TrialPruned:
@@ -1281,9 +2024,18 @@ class GAKOptunaOptimizer:
             trial.set_user_attr("P_fusion_W", float(m.get("avg_P_fusion_W", 0.0)))
             trial.set_user_attr("P_electric_W",
                                 float((m.get("station") or {}).get("P_electric_W", 0.0)))
-            trial.set_user_attr("P_net_W",
-                                float((m.get("station") or {}).get("P_net_W", 0.0)))
-            trial.set_user_attr("beta", float(m.get("avg_beta", 0.0)))
+            # v41: P_net_W — ПОСЛЕ бета-штрафа (в v40 писали до: value и P_net_W расходились)
+            _beta41 = float(m.get("avg_beta", 0.0))
+            _mult41 = 1.0 if _beta41 <= self.BETA_MAX else (self.BETA_MAX / _beta41) ** 2
+            _Pnet_raw41 = float((m.get("station") or {}).get("P_net_W", 0.0))
+            trial.set_user_attr("P_net_W", _Pnet_raw41 * _mult41)
+            trial.set_user_attr("beta", _beta41)
+            trial.set_user_attr("beta_penalty_mult", float(_mult41))
+            trial.set_user_attr("recirc_raw",
+                                float((m.get("station") or {}).get("recirc_raw", 0.0)))
+            _B41 = float((cfg.get("plasma_monitor") or {}).get("external_B", 0.0) or 0.0)
+            _a41 = float((cfg.get("plasma_monitor") or {}).get("radius", 0.0) or 0.0)
+            trial.set_user_attr("greenwald_n", float(self.greenwald_limit(_B41, _a41)))
             # v37: метрики грязной плазмы в атрибуты триала
             trial.set_user_attr("f_He", float(m.get("f_He", 0.0)))
             trial.set_user_attr("Z_eff", float(m.get("Z_eff", 1.0)))
@@ -1295,17 +2047,37 @@ class GAKOptunaOptimizer:
             self._auto_learn(cfg, m)
             # v33: objective — ПОЛНАЯ мощность (Вт), а не плотность (Вт/м3)
             # v37.2: objective — ЧИСТАЯ мощность станции; налог на насосы виден TPE
-            P_net_W = float((m.get("station") or {}).get("P_net_W",
-                          m.get("avg_P_fusion_W", 0.0)))
-            # v36: мягкий штраф за превышение MHD-беты (предел 8%)
-            beta = float(m.get("avg_beta", 0.0))
-            if beta > self.BETA_MAX:
-                P_net_W *= (self.BETA_MAX / beta) ** 2
+            # v41: телеметрия уже штрафована — переиспользуем (один расчёт, ноль дублей)
+            P_net_W = _Pnet_raw41 * _mult41
+            # v44: режим lcoe — objective = LCOE ($/МВт·ч) со штрафом за стенку
+            if self.mode == "lcoe":
+                eco = self._economics(cfg, m)
+                for _k, _v in eco.items():
+                    trial.set_user_attr(_k, float(_v))
+                trial.set_user_attr("P_net_W_final", float(P_net_W))
+                # v46D.1: reject ровно по лимиту чешуи 18 (3x множитель снят вместе со штрафом)
+                _wall_lim = self.MATERIALS.get(
+                    (cfg.get("vacuum_monitor") or {}).get("wall_material", "steel"),
+                    self.MATERIALS["steel"])[0]  # v46H: reject по лимиту материала
+                if eco["wall_load_W_m2"] > _wall_lim:
+                    return 1e10
+                # v46M FIX (баг v44, флаг Дипсика на run15): бета-штраф не доходил
+                # до LCOE — сжатие при beta>0.15 покупалось багом. Честный LCOE:
+                _lcoe46m = float(eco["lcoe"]) / _mult41
+                trial.set_user_attr("lcoe_nobeta", float(eco["lcoe"]))
+                trial.set_user_attr("lcoe", _lcoe46m)
+                return _lcoe46m
+            # v45R: жёсткий лимит стенки — reject в power-режиме тоже
+            _wall = self._wall_load(cfg, m)
+            trial.set_user_attr("wall_load_W_m2", float(_wall))
+            if _wall > self.WALL_LIMIT_W_M2:
+                return 1e10
             return -P_net_W
 
         def objective_gain(trial):
             cfg = self._build_trial_config(trial)
-            if self._prescreen(cfg) == 'reject':
+            pr_reason = self._prescreen_checked(trial, cfg)
+            if pr_reason:
                 return 1e10
             try:
                 m = self._run_quick(cfg, trial=trial)
@@ -1322,8 +2094,18 @@ class GAKOptunaOptimizer:
             trial.set_user_attr("P_fusion_W", float(m.get("avg_P_fusion_W", 0.0)))
             trial.set_user_attr("P_electric_W",
                                 float((m.get("station") or {}).get("P_electric_W", 0.0)))
-            trial.set_user_attr("P_net_W",
-                                float((m.get("station") or {}).get("P_net_W", 0.0)))
+            # v41: P_net_W — ПОСЛЕ бета-штрафа + доп. поля телеметрии
+            _beta41 = float(m.get("avg_beta", 0.0))
+            _mult41 = 1.0 if _beta41 <= self.BETA_MAX else (self.BETA_MAX / _beta41) ** 2
+            _Pnet_raw41 = float((m.get("station") or {}).get("P_net_W", 0.0))
+            trial.set_user_attr("P_net_W", _Pnet_raw41 * _mult41)
+            trial.set_user_attr("beta", _beta41)
+            trial.set_user_attr("beta_penalty_mult", float(_mult41))
+            trial.set_user_attr("recirc_raw",
+                                float((m.get("station") or {}).get("recirc_raw", 0.0)))
+            _B41 = float((cfg.get("plasma_monitor") or {}).get("external_B", 0.0) or 0.0)
+            _a41 = float((cfg.get("plasma_monitor") or {}).get("radius", 0.0) or 0.0)
+            trial.set_user_attr("greenwald_n", float(self.greenwald_limit(_B41, _a41)))
             # v37: метрики грязной плазмы
             trial.set_user_attr("f_He", float(m.get("f_He", 0.0)))
             trial.set_user_attr("Z_eff", float(m.get("Z_eff", 1.0)))
@@ -1335,17 +2117,37 @@ class GAKOptunaOptimizer:
             self._auto_learn(cfg, m)
             # v33: objective — ПОЛНАЯ мощность (Вт), а не плотность (Вт/м3)
             # v37.2: objective — ЧИСТАЯ мощность станции; налог на насосы виден TPE
-            P_net_W = float((m.get("station") or {}).get("P_net_W",
-                          m.get("avg_P_fusion_W", 0.0)))
-            # v36: мягкий штраф за превышение MHD-беты (предел 8%)
-            beta = float(m.get("avg_beta", 0.0))
-            if beta > self.BETA_MAX:
-                P_net_W *= (self.BETA_MAX / beta) ** 2
+            # v41: телеметрия уже штрафована — переиспользуем (один расчёт, ноль дублей)
+            P_net_W = _Pnet_raw41 * _mult41
+            # v44: режим lcoe — objective = LCOE ($/МВт·ч) со штрафом за стенку
+            if self.mode == "lcoe":
+                eco = self._economics(cfg, m)
+                for _k, _v in eco.items():
+                    trial.set_user_attr(_k, float(_v))
+                trial.set_user_attr("P_net_W_final", float(P_net_W))
+                # v46D.1: reject ровно по лимиту чешуи 18 (3x множитель снят вместе со штрафом)
+                _wall_lim = self.MATERIALS.get(
+                    (cfg.get("vacuum_monitor") or {}).get("wall_material", "steel"),
+                    self.MATERIALS["steel"])[0]  # v46H: reject по лимиту материала
+                if eco["wall_load_W_m2"] > _wall_lim:
+                    return 1e10
+                # v46M FIX (баг v44, флаг Дипсика на run15): бета-штраф не доходил
+                # до LCOE — сжатие при beta>0.15 покупалось багом. Честный LCOE:
+                _lcoe46m = float(eco["lcoe"]) / _mult41
+                trial.set_user_attr("lcoe_nobeta", float(eco["lcoe"]))
+                trial.set_user_attr("lcoe", _lcoe46m)
+                return _lcoe46m
+            # v45R: жёсткий лимит стенки — reject в power-режиме тоже
+            _wall = self._wall_load(cfg, m)
+            trial.set_user_attr("wall_load_W_m2", float(_wall))
+            if _wall > self.WALL_LIMIT_W_M2:
+                return 1e10
             return -P_net_W
 
         def objective_pareto(trial):
             cfg = self._build_trial_config(trial)
-            if self._prescreen(cfg) == 'reject':
+            pr_reason = self._prescreen_checked(trial, cfg)
+            if pr_reason:
                 return [-1e10, -1e10]
             try:
                 m = self._run_quick(cfg, trial=trial)
@@ -1356,6 +2158,26 @@ class GAKOptunaOptimizer:
                 return [-1e10, -1e10]
             self._auto_learn(cfg, m)
             return [m.get("avg_pair_rate", 0), m.get("avg_Q_plasma", 0)]
+
+        def _safe_obj(fn):
+            # v45R.2: исключение в объективе пишется в триал (user_attrs["error"]),
+            # триал завершается с reject-сентинелом — study больше не опустевает молча
+            _is_pareto = (fn.__name__ == "objective_pareto")
+            def _wrapped(trial):
+                try:
+                    return fn(trial)
+                except optuna.TrialPruned:
+                    raise
+                except Exception as e:
+                    try:
+                        trial.set_user_attr("error", f"{type(e).__name__}: {e}")
+                    except Exception:
+                        pass
+                    return [-1e10, -1e10] if _is_pareto else 1e10
+            return _wrapped
+        objective_ignition = _safe_obj(objective_ignition)
+        objective_gain = _safe_obj(objective_gain)
+        objective_pareto = _safe_obj(objective_pareto)
 
         if n_trials > 0:
             if mode == "ignition":
@@ -1369,6 +2191,12 @@ class GAKOptunaOptimizer:
             elif mode == "pareto":
                 self.study.optimize(objective_pareto, n_trials=n_trials, show_progress_bar=True,
                                  callbacks=[self._make_progress_callback(n_trials), self._make_stop_callback()],
+                                   catch=(Exception,))
+            elif mode == "lcoe":
+                # v44: тот же прогон физики, но value = LCOE (минимизируем)
+                self.study.optimize(objective_ignition, n_trials=n_trials, show_progress_bar=True,
+                                   callbacks=[self._make_progress_callback(n_trials), self._make_stop_callback(),
+                                   _reenqueue_champion],  # v46O: память TPE
                                    catch=(Exception,))
             else:
                 raise ValueError(f"Неизвестный режим: {mode}")
@@ -1394,6 +2222,21 @@ class GAKOptunaOptimizer:
                 print(f"  Pruner: {pruned} trials pruned early (saved ~{pruned * 27}s)")
             except Exception:
                 pass
+
+        # v44: автосохранение датасета — экспорт и обучение больше не расходятся
+        self._save_training_dataset()
+
+        # v46A: сводка по выравниванию прокачки
+        try:
+            _al = [t for t in self.study.get_trials(deepcopy=False)
+                   if t.state == optuna.trial.TrialState.COMPLETE
+                   and "alignment" in t.params and t.value is not None]
+            if _al:
+                _best_al = min(_al, key=lambda t: t.value)
+                print(f"  v46A: лучший с alignment={_best_al.params.get('alignment'):.3f}: "
+                      f"LCOE={_best_al.value:.2f} $/МВт·ч")
+        except Exception:
+            pass
 
         self._extract_results()
 
@@ -1467,7 +2310,8 @@ class GAKOptunaOptimizer:
 
         def objective_ignition_cascade(trial):
             cfg = self._build_cascade_config(trial, 'ignition')
-            if self._prescreen(cfg) == 'reject':
+            pr_reason = self._prescreen_checked(trial, cfg)
+            if pr_reason:
                 return 1e10
             try:
                 m = self._run_quick(cfg, trial=trial)
@@ -1497,7 +2341,18 @@ class GAKOptunaOptimizer:
             except Exception:
                 pass
 
-        study1.optimize(objective_ignition_cascade, n_trials=n_trials_phase1,
+        def _casc_safe(trial):
+            try:
+                return objective_ignition_cascade(trial)
+            except optuna.TrialPruned:
+                raise
+            except Exception as e:
+                try:
+                    trial.set_user_attr("error", f"{type(e).__name__}: {e}")
+                except Exception:
+                    pass
+                return 1e10
+        study1.optimize(_casc_safe, n_trials=n_trials_phase1,
                        show_progress_bar=True, callbacks=[progress1])
 
         st.info(f"Phase 1 завершена. Лучший score: {-study1.best_value:.2f}")
@@ -1909,6 +2764,17 @@ class GAKOptunaOptimizer:
                 ],
             }
         else:
+            # v45R.2: пустой study — внятный диагноз вместо голого "Record does not exist"
+            _all = self.study.get_trials(deepcopy=False)
+            _states = {}
+            for _t in _all:
+                _states[_t.state.name] = _states.get(_t.state.name, 0) + 1
+            if not any(_t.state == optuna.trial.TrialState.COMPLETE for _t in _all):
+                _errs = [(t.number, t.user_attrs.get("error", "причина не записана"))
+                         for t in _all if t.state == optuna.trial.TrialState.FAIL][-5:]
+                raise RuntimeError(
+                    "В study нет завершённых триалов. Состояния: {}. "
+                    "Последние ошибки FAIL: {}".format(_states, _errs))
             best = self.study.best_trial
             trial = optuna.trial.FixedTrial(best.params)
             cfg = self._build_trial_config(trial)

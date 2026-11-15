@@ -22,7 +22,9 @@ Plasma Monitor — модуль плазменной оболочки.
   v0.7 — Bremsstrahlung (radiation_scale), фикс: только радиационные потери в run()
   v0.8 — фикс размерности Швингера и Bremsstrahlung: dt + V в run()
   v0.9 — альфа-нагрев (alpha_frac) + синхротронное излучение (P_sync) с отражением стенки
-  v0.10 — Bosch-Hale параметризация для compute_reactivity() (замена упрощённой формулы)\n  v0.11 — фикс Bremsstrahlung (5.35e-37 для T в кэВ), Z_eff из конфига, radiation_scale убран
+  v0.10 — Bosch-Hale параметризация для compute_reactivity() (замена упрощённой формулы)\n  v0.15 — фикс теплоёмкости (1.5→3.0), P_sync на сжатом B, Q_self
+  v0.22 — фикс init(): жёсткий сброс T и r_plasma из конфига
+  v0.11 — фикс Bremsstrahlung (5.35e-37 для T в кэВ), Z_eff из конфига, radiation_scale убран
 """
 
 import numpy as np
@@ -113,6 +115,7 @@ class PlasmaMonitor(BaseModule):
 
         cfg = dict(config or {})
         cfg.update(kwargs)
+        self._init_config = cfg  # v22: сохраняем для init()
 
         # Геометрия
         self.radius = float(cfg.get("radius", 1.0e-2))
@@ -168,10 +171,16 @@ class PlasmaMonitor(BaseModule):
         self.last_balance = None
         self._last_dt = 1.0e-6
 
+
         # Автозапитка (v0.3)
         self.auto_feed_enabled = cfg.get("auto_feed_enabled", True)
         self.sigma_wall = float(cfg.get("sigma_wall", 5.96e7))
         self.delta_wall = float(cfg.get("delta_wall", 0.01))
+
+        # Динамика плазмы (v0.14)
+        self.r_plasma = float(cfg.get("r_plasma", self.radius * 0.95))  # начальный радиус плазмы
+        self.v_r = 0.0  # радиальная скорость плазмы, м/с
+        self.plasma_mass = float(cfg.get("plasma_mass", 0.0))  # масса плазмы, кг (0 = авто)
 
         self.logger = get_logger("plasma_monitor")
         self.results = None
@@ -182,6 +191,15 @@ class PlasmaMonitor(BaseModule):
             self.ion_mass = max(masses)
 
     def init(self) -> bool:
+        # v22: жёсткий сброс стартовой температуры и геометрии из конфига
+        # Гарантируем, что физика стартует строго с Кельвинов Оптимизатора
+        cfg = getattr(self, '_init_config', None) or getattr(self, 'config', None) or {}
+        if cfg:
+            self.temperature = float(cfg.get("temperature", 5.0e6))
+            r = float(cfg.get("radius", 0.01))
+            self.r_plasma = float(cfg.get("r_plasma", r * 0.95))
+        self.sim_time = 0.0
+        self.v_r = 0.0
         self._set_initialized(True)
         self.logger.info(
             f"Инициализация Plasma Monitor: "
@@ -259,26 +277,27 @@ class PlasmaMonitor(BaseModule):
     def run(self, external_stress=None) -> dict:
         ext = external_stress or {}
 
-        B = self.compute_magnetic_field()
+        B = self._compute_compressed_B()  # v0.15: сжатое поле для синхротрона
+        B_nosqueeze = self.compute_magnetic_field()  # для barrier/viscous
         B_z = self._compute_z_pinch_field()
         if B_z > 0:
-            B = np.sqrt(B**2 + B_z**2)
+            B_nosqueeze = np.sqrt(B_nosqueeze**2 + B_z**2)
 
         delta_E = self.compute_ekman_layer()
-        sigma_viscous = self.compute_viscous_stress(delta_E, B)
-        barrier = self.compute_barrier_index(delta_E, B)
-        diffusion = self._compute_diffusion_coeff(B)
+        sigma_viscous = self.compute_viscous_stress(delta_E, B_nosqueeze)
+        barrier = self.compute_barrier_index(delta_E, B_nosqueeze)
+        diffusion = self._compute_diffusion_coeff(B_nosqueeze)
         T_plasma = self.temperature
 
         sigma_thermal = ext.get("sigma_thermal", 0.0)
         if sigma_thermal > 0:
             volume = (4.0 / 3.0) * np.pi * self.radius**3
-            dT = sigma_thermal * volume / (self.density_number * K_B * self.radius**2)
+            dT = sigma_thermal * volume / (3.0 * self.density_number * K_B * self.radius**2)  # v0.15
             T_plasma += dT
 
         sigma_osmotic = ext.get("sigma_osmotic", 0.0)
         if sigma_osmotic > 0:
-            T_plasma += sigma_osmotic * 1e-3 / (self.density_number * K_B)
+            T_plasma += sigma_osmotic * 1e-3 / (3.0 * self.density_number * K_B)  # v0.15
 
         V = (4.0 / 3.0) * np.pi * self.radius**3
         dt_eff = self._last_dt
@@ -287,18 +306,18 @@ class PlasmaMonitor(BaseModule):
         if self.quantum_feedback and pair_rate > 0:
             dE = pair_rate * self.pair_energy_gain * dt_eff
             if V > 0 and self.density_number > 0:
-                T_plasma += dE / (1.5 * self.density_number * K_B * V)
+                T_plasma += dE / (3.0 * self.density_number * K_B * V)  # v0.15
 
         P_rad = self.compute_radiation_loss(T_plasma)
         if V > 0 and self.density_number > 0:
-            dT_rad = P_rad * dt_eff / (1.5 * self.density_number * K_B * V)
+            dT_rad = P_rad * dt_eff / (3.0 * self.density_number * K_B * V)  # v0.15
             T_plasma -= dT_rad
 
         T_keV_now = T_plasma * K_B / (E_CHARGE * 1e3)
-        P_sync_vol = C_SYNC * self.density_number * B**2 * max(T_keV_now, 0.0)**2
+        P_sync_vol = C_SYNC * self.density_number * B**2 * max(T_keV_now, 0.0)**2  # v0.15: B уже сжатое
         P_sync_net = P_sync_vol * (1.0 - self.wall_reflectivity)
         if V > 0 and self.density_number > 0:
-            dT_sync = P_sync_net * dt_eff / (1.5 * self.density_number * K_B)
+            dT_sync = P_sync_net * dt_eff / (3.0 * self.density_number * K_B)  # v0.15
             T_plasma -= dT_sync
 
         if self.auto_feed:
@@ -315,9 +334,9 @@ class PlasmaMonitor(BaseModule):
         coriolis_stress = coriolis["coriolis_stress"]
 
         plasma_stress = sigma_viscous + self.mass_density * self.flow_velocity**2 + coriolis_stress
-        magnetic_coupling = B / self.breakdown_B
+        magnetic_coupling = B_nosqueeze / self.breakdown_B
 
-        if B >= self.breakdown_B:
+        if B_nosqueeze >= self.breakdown_B:
             phase = "BREAKDOWN"
         elif self.gap <= delta_E * 0.5:
             phase = "CONTACT"
@@ -362,6 +381,21 @@ class PlasmaMonitor(BaseModule):
     def _T_to_keV(self) -> float:
         return self.temperature * K_B / (E_CHARGE * 1e3)
 
+    def _compute_compressed_B(self) -> float:
+        """B at current plasma radius (сферическое сохранение потока: B ~ 1/r²)."""
+        B_0 = self.compute_magnetic_field()
+        B_z = self._compute_z_pinch_field()
+        if B_z > 0:
+            B_0 = np.sqrt(B_0**2 + B_z**2)
+        r_0 = self.radius
+        r_eff = max(self.r_plasma, 1e-6)
+        if r_eff >= r_0 * 0.95:
+            return B_0
+        # Z-pinch scaling: B * r = const → B = B_0 * (r_0 / r)
+        B_comp = B_0 * (r_0 / r_eff)**2  # сферическое сохранение потока
+        B_comp = min(B_comp, 500.0)  # cap at 500 T
+        return float(B_comp)
+
     def compute_tau_E(self) -> float:
         T_keV = self._T_to_keV()
         if T_keV <= 0:
@@ -369,14 +403,39 @@ class PlasmaMonitor(BaseModule):
         n_20 = self.density_number / 1e20
         if n_20 <= 0:
             return 0.0
-        B = self.compute_magnetic_field()
-        B_z = self._compute_z_pinch_field()
-        if B_z > 0:
-            B = np.sqrt(B**2 + B_z**2)
+        # v0.14: используем сжатый B (flux conservation)
+        B = self._compute_compressed_B()
         if B <= 0:
             return 0.0
-        tau_E = C_GYRO_BOHM * self.radius**2 * B**2 / (np.sqrt(T_keV) * n_20)
-        return float(tau_E)
+
+        # gyro-Bohm (базовый канал) — v0.14: используем r_plasma
+        r_eff = max(self.r_plasma, 1e-6)
+        tau_bohm = C_GYRO_BOHM * r_eff**2 * B**2 / (np.sqrt(T_keV) * n_20)
+
+        # Ekman-потери (v0.12): погранслой добавляет радиальный транспорт
+        delta_E = self.compute_ekman_layer()
+        tau_ekman = 0.0
+        if delta_E > 0 and self.rotation_freq > 0:
+            v_E = delta_E * self.rotation_freq
+            if v_E > 0:
+                tau_ekman = r_eff / (2.0 * v_E)
+
+        # Комбинируем: 1/tau_eff = 1/tau_bohm + 1/tau_ekman
+        if tau_ekman > 0:
+            tau_eff = 1.0 / (1.0 / tau_bohm + 1.0 / tau_ekman)
+        else:
+            tau_eff = tau_bohm
+
+        # Shear-стабилизация (v0.12): safety factor q = r*B_z / (R*B_theta)
+        B_z = self._compute_z_pinch_field()
+        if B_z > 0 and B > 0:
+            B_eq = np.sqrt(2.0 * MU_0 * self.density_number * K_B * self.temperature)
+            if B_eq > 0:
+                q_safety = r_eff * B_z / (max(self.radius, 1e-6) * B_eq)
+                shear_factor = q_safety / (q_safety + 1.0)  # 0..1
+                tau_eff *= (1.0 + shear_factor)  # до 2x
+
+        return float(tau_eff)
 
     def compute_reactivity(self) -> float:
         """Bosch-Hale параметризация <σv> [м³/с]. T в кэВ."""
@@ -401,16 +460,135 @@ class PlasmaMonitor(BaseModule):
         return float(sv_m3)
 
     def compute_synchrotron_loss(self) -> float:
+        """v0.15: используем сжатое B (flux conservation B ~ 1/r²)."""
         T_keV = self._T_to_keV()
         if T_keV <= 0:
             return 0.0
-        B = self.compute_magnetic_field()
-        B_z = self._compute_z_pinch_field()
-        if B_z > 0:
-            B = np.sqrt(B**2 + B_z**2)
+        B = self._compute_compressed_B()  # v0.15: сжатое поле, не несжатое
         P_sync = C_SYNC * self.density_number * B**2 * T_keV**2
         P_sync_net = P_sync * (1.0 - self.wall_reflectivity)
         return float(P_sync_net)
+
+    # === Динамика плазмы (v0.14) ===
+
+    def _compute_plasma_mass(self) -> float:
+        if self.plasma_mass > 0:
+            return self.plasma_mass
+        r_eff = max(self.r_plasma, 1e-6)
+        V = (4.0 / 3.0) * np.pi * r_eff**3
+        return self.mass_density * V
+
+    def _compute_lorentz_force(self) -> float:
+        """Лоренц-сила, сжимающая плазменный шнур внутрь."""
+        B = self._compute_compressed_B()
+        r_eff = max(self.r_plasma, 1e-6)
+        A_cross = np.pi * r_eff**2
+        I_plasma = self.density_number * E_CHARGE * self.flow_velocity * A_cross
+        F_lorentz = I_plasma * B * 2.0 * np.pi * r_eff
+        return float(F_lorentz)
+
+    def _compute_wall_restoring_force(self) -> float:
+        """Индукционная восстанавливающая сила от стенки (Фарадей)."""
+        if not self.auto_feed_enabled:
+            return 0.0
+        r_eff = max(self.r_plasma, 1e-6)
+        B = self.compute_magnetic_field()
+        R_wall = 1.0 / max(self.sigma_wall * self.delta_wall, 1e-30)
+        emf_wall = B * 2.0 * np.pi * r_eff * abs(self.v_r)
+        I_wall = emf_wall / max(R_wall, 1e-30)
+        B_wall = MU_0 * I_wall / (2.0 * np.pi * max(r_eff, 1e-6))
+        A_cross = np.pi * r_eff**2
+        I_plasma = self.density_number * E_CHARGE * self.flow_velocity * A_cross
+        F_restore = I_plasma * B_wall
+        return float(F_restore)
+
+    def _compute_centrifugal_force(self) -> float:
+        """Центробежная сила от вращения плазмы (наружу)."""
+        r_eff = max(self.r_plasma, 1e-6)
+        m = self._compute_plasma_mass()
+        Omega = self.rotation_freq
+        return float(m * Omega**2 * r_eff)
+
+    def compute_safety_factor(self) -> float:
+        """Safety factor q = r * B_z / (R * B_theta)."""
+        B_z = self._compute_z_pinch_field()
+        if B_z <= 0:
+            return 0.0
+        B_eq = np.sqrt(2.0 * MU_0 * self.density_number * K_B * self.temperature)
+        if B_eq <= 0:
+            return 0.0
+        r_eff = max(self.r_plasma, 1e-6)
+        q = r_eff * B_z / (max(self.radius, 1e-6) * B_eq)
+        return float(q)
+
+    def step_plasma_dynamics(self, dt: float) -> dict:
+        """
+        v0.14: Аналитическое равновесие плазмы.
+        Плазма быстро достигает равновесия (Альфвеновское время ~ мкс),
+        поэтому вычисляем равновесный радиус напрямую вместо численного
+        интегрирования уравнения движения.
+
+        Равновесие: F_lorentz = F_pressure + F_centrifugal
+          F_lorentz  = 2*pi^2 * n * e * v * B * r^3  (внутрь)
+          F_pressure = n * k_B * T * pi * r^2         (наружу)
+          F_centrif  = rho * 4/3 * pi * Omega^2 * r^4 (наружу)
+
+        Делим на pi*r^2:
+          2*pi*n*e*v*B*r = n*k_B*T + rho*4/3*Omega^2*r^2
+        Квадратное уравнение: a*r^2 + b*r + c = 0
+        """
+        B = self._compute_compressed_B()
+
+        a_coeff = self.mass_density * 4.0 / 3.0 * self.rotation_freq**2
+        b_coeff = -2.0 * np.pi * self.density_number * E_CHARGE * self.flow_velocity * B
+        c_coeff = self.density_number * K_B * self.temperature
+
+        r_eq = self.radius * 0.5  # default
+
+        if abs(a_coeff) > 1e-30:
+            disc = b_coeff**2 - 4.0 * a_coeff * c_coeff
+            if disc >= 0:
+                r1 = (-b_coeff + np.sqrt(disc)) / (2.0 * a_coeff)
+                r2 = (-b_coeff - np.sqrt(disc)) / (2.0 * a_coeff)
+                for r in [r1, r2]:
+                    if 0 < r < self.radius:
+                        r_eq = r
+                        break
+        else:
+            if abs(b_coeff) > 1e-30:
+                r_eq = -c_coeff / b_coeff
+
+        # Ограничения: плазма не схлопывается и не касается стенки
+        r_min = self.radius * 0.7
+        r_max = self.radius * 0.95
+        r_eq = max(r_min, min(r_max, r_eq))
+
+        # Плавный переход к равновесию (избегаем скачков)
+        alpha = min(dt * 1e3, 1.0)
+        self.r_plasma += alpha * (r_eq - self.r_plasma)
+        self.v_r = 0.0
+
+        if np.isnan(self.r_plasma) or np.isinf(self.r_plasma):
+            self.r_plasma = self.radius * 0.5
+
+        # Силы для логирования
+        r_eff = max(self.r_plasma, 1e-6)
+        F_lorentz = self._compute_lorentz_force()
+        F_restore = self._compute_wall_restoring_force()
+        F_centrifugal = self._compute_centrifugal_force()
+        P_plasma = self.density_number * K_B * self.temperature
+        F_pressure = P_plasma * np.pi * r_eff**2
+        F_net = F_pressure + F_centrifugal + F_restore - F_lorentz
+
+        return {
+            "r_plasma": float(self.r_plasma),
+            "v_r": float(self.v_r),
+            "F_lorentz": float(F_lorentz),
+            "F_restore": float(F_restore),
+            "F_centrifugal": float(F_centrifugal),
+            "F_pressure": float(F_pressure),
+            "F_net": float(F_net),
+        }
 
     def compute_energy_balance(self) -> dict:
         T_keV = self._T_to_keV()
@@ -439,6 +617,18 @@ class PlasmaMonitor(BaseModule):
 
         dE_dt = P_alpha - P_rad - P_cond - P_sync
 
+        # v0.15: Q_self — без Швингера, честная самоподдержка
+        P_loss_total = P_rad + P_cond + P_sync
+        Q_self = P_alpha / P_loss_total if P_loss_total > 0 and P_loss_total < 1e30 else 0.0
+
+        # Q_with_schwinger — с Швингер-нагревом (если включён)
+        P_schwinger = 0.0
+        if self.quantum_feedback:
+            V = (4.0 / 3.0) * np.pi * max(self.r_plasma, 1e-6)**3
+            P_schwinger = self.pair_energy_gain * 1e10 * V  # cap pair_rate = 1e10
+        P_heat_total = P_alpha + P_schwinger
+        Q_with_schwinger = P_heat_total / P_loss_total if P_loss_total > 0 and P_loss_total < 1e30 else 0.0
+
         result = {
             "P_fusion": float(P_fusion),
             "P_alpha": float(P_alpha),
@@ -450,6 +640,9 @@ class PlasmaMonitor(BaseModule):
             "tau_E": float(tau_E),
             "T_keV": float(T_keV),
             "reactivity": float(sv),
+            "Q_self": float(Q_self),           # v0.15: без Швингера
+            "Q_schwinger": float(Q_with_schwinger),  # v0.15: с Швингером
+            "P_schwinger": float(P_schwinger),       # v0.15: мощность Швингера
         }
 
         self.last_balance = result
@@ -462,7 +655,7 @@ class PlasmaMonitor(BaseModule):
         product = self.density_number * T_keV * tau_E
         return product >= threshold
 
-    def step(self, dt: float) -> dict:
+    def step(self, dt: float, pair_rate: float = 0.0) -> dict:
         self._last_dt = dt
 
         balance = self.compute_energy_balance()
@@ -470,11 +663,19 @@ class PlasmaMonitor(BaseModule):
         dE_dt = balance["dE_dt"]
 
         if n > 0:
-            dT = dE_dt * dt / (1.5 * n * K_B)
+            dT = dE_dt * dt / (3.0 * n * K_B)  # v0.15: 3.0 (ионы+электроны), было 1.5
         else:
             dT = 0.0
 
         self.temperature += dT
+
+        # ── Швингер-нагрев (без клампа, pair_rate ограничен в optuna_optimizer) ──
+        if pair_rate > 0 and self.quantum_feedback:
+            V = (4.0 / 3.0) * np.pi * self.radius ** 3
+            if V > 0 and self.density_number > 0:
+                dE_schwinger = pair_rate * self.pair_energy_gain * dt
+                dT_schwinger = dE_schwinger / (3.0 * self.density_number * K_B * V)  # v0.15
+                self.temperature += dT_schwinger
 
         if np.isnan(self.temperature):
             self.temperature = 0.0
@@ -484,6 +685,9 @@ class PlasmaMonitor(BaseModule):
             self.temperature = 1e12
 
         self.sim_time += dt
+
+        # ── Динамика плазмы (v0.14): аналитическое равновесие ──
+        plasma_dyn = self.step_plasma_dynamics(dt)
 
         result = {
             "temperature": float(self.temperature),
@@ -498,6 +702,16 @@ class PlasmaMonitor(BaseModule):
             "tau_E": balance["tau_E"],
             "sim_time": float(self.sim_time),
             "lawson_ignited": self.check_lawson(),
+            "Q_self": balance.get("Q_self", 0.0),        # v0.15
+            "Q_schwinger": balance.get("Q_schwinger", 0.0),  # v0.15
+            "P_schwinger": balance.get("P_schwinger", 0.0),  # v0.15
+            # v0.14
+            "r_plasma": float(self.r_plasma),
+            "v_r": float(self.v_r),
+            "F_lorentz": plasma_dyn["F_lorentz"],
+            "F_restore": plasma_dyn["F_restore"],
+            "F_net": plasma_dyn["F_net"],
+            "safety_factor": self.compute_safety_factor(),
         }
 
         return result

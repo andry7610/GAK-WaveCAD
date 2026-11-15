@@ -59,12 +59,13 @@ plasma_monitor:
   external_B: 50.0
   breakdown_B: 60.0
   barrier_threshold: 0.3
-  fuel_type: D-He3
+  fuel_type: D-T
   auto_feed_enabled: true
   sigma_wall: 59600000.0
   delta_wall: 0.01
   Z_eff: 1.0
   radiation_scale: 0.003
+  wall_reflectivity: 0.97
 vacuum_monitor:
   P_initial: 100000.0
   T_gas: 300.0

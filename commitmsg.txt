@@ -1,0 +1,8 @@
+v37.2: dirty plasma - helium ash + tungsten, objective -> P_net (v9.3 -> v37.2 rewrite)
+
+- helium ash: f_He = min(0.30, C_ASH*R_burn/(n*V*pump)), power ~ (1-f_He)^2
+- tungsten impurity: c_W=1e-4, Z_eff=1.5402
+- FIX (DeepSeek review): objective returns -P_net_W, not -P_fusion_W
+- FIX: pump_speed read from vacuum_monitor (was dead knob)
+- pruner & _refine_top on P_net scale; P_net_W/P_electric_W in trial attrs
+- records: 1527.3 MW gross (v36.3 era), 597.24 MW net (trial 37, v37.2)
