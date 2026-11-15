@@ -32,3 +32,4 @@ results/*
 # AI-модель фильтра — нужна оптимизатору, живёт локально
 models/ai_predictor_DT.json
 
+"GAK-WaveCAD-main/" 
