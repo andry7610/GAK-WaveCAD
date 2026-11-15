@@ -41,8 +41,11 @@ def _make_plasma(**kwargs):
 
 def test_lawson_dt_above_threshold():
     """D-T: ITER-масштаб → n*T*tau_E > 3e21 → зажигается."""
+    # v37.2: модель ужесточила tau_E (~1.83 c вместо >3 c при старых параметрах),
+    # поэтому плотность поднята с 1.0e20 до 2.5e20 — произведение Лоусона
+    # уверенно пробивает порог 3e21 с запасом.
     p = _make_plasma(
-        density_number=1.0e20,
+        density_number=2.5e20,
         temperature=1.16e8,   # ~10 кэВ
         external_B=10.0,      # сильное поле
         radius=1.0,           # ITER-масштаб
@@ -100,8 +103,10 @@ def test_lawson_dt_below_threshold():
 ])
 def test_lawson_uses_correct_threshold(fuel, threshold):
     """Порог Лоусона зависит от типа топлива."""
+    # v37.2: плотность поднята с 1.0e20 до 2.5e20 (см. test_lawson_dt_above_threshold);
+    # D-D и D-He3 всё равно остаются ниже своих порогов (1e24 и 1e22).
     p = _make_plasma(
-        density_number=1.0e20,
+        density_number=2.5e20,
         temperature=1.16e8,  # 10 кэВ
         external_B=10.0,
         radius=1.0,           # ITER-масштаб
