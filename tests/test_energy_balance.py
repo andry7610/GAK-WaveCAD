@@ -1,7 +1,7 @@
 """
-Энергобаланс плазмы: P_fusion vs P_rad + P_cond.
+Энергобаланс плазмы (v37.2): P_alpha (20% P_fusion) vs P_rad + P_cond + P_sync.
 
-dE/dt = P_fusion - P_radiation - P_conduction
+dE/dt = P_alpha - P_rad - P_conduction - P_sync
 """
 
 import numpy as np
@@ -32,7 +32,8 @@ def _make_plasma(**kwargs):
 def test_positive_balance_heats_plasma():
     """ITER-масштаб: P_fus > P_rad + P_cond -> dE/dt > 0."""
     p = _make_plasma(
-        density_number=2.0e20,
+        density_number=3.0e20,  # v37.2: греет только P_alpha (alpha_frac=0.2), при 2.0e20
+                                # баланс сидел на кромке (dE/dt = -3.4%), поднимаем n
         temperature=1.5e8,      # ~13 кэВ (близко к пику <σv> для D-T)
         external_B=10.0,       # сильное поле -> большое tau_E -> малые потери
         radius=1.0,             # ITER-масштаб
@@ -44,8 +45,10 @@ def test_positive_balance_heats_plasma():
     assert balance["dE_dt"] > 0, (
         f"Ожидался положительный баланс, получили dE/dt = {balance['dE_dt']:.3e} Вт/м³\n"
         f"  P_fusion = {balance['P_fusion']:.3e}\n"
-        f"  P_rad    = {balance['P_radiation']:.3e}\n"
-        f"  P_cond   = {balance['P_conduction']:.3e}"
+        f"  P_alpha  = {balance['P_alpha']:.3e}\n"
+        f"  P_rad    = {balance['P_rad']:.3e}\n"
+        f"  P_cond   = {balance['P_cond']:.3e}\n"
+        f"  P_sync   = {balance['P_sync']:.3e}"
     )
 
 
