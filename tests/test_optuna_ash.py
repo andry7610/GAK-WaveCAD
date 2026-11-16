@@ -111,7 +111,14 @@ def test_f_he_cap():
 
 
 def test_optimizer_class_consistency():
-    """Если класс импортируется — сверяем константы и вызов _station_balance."""
+    """Если класс импортируется — сверяем константы и вызов _station_balance.
+
+    v46B: класс по умолчанию считает нижний каскад по COOLANT (гелиевый
+    цикл, eta_low ~ 0.576), а чемпион trial 37 записан в паровую эпоху
+    (eta_low = ETA_STEAM = 0.42). Локальные формулы теста якорь
+    воспроизводят точно — поэтому для сверки с якорем временно
+    переключаем класс в паровой режим, как в эпоху v37.2.
+    """
     if not _HAVE_OPTIMIZER:
         return  # зависимости не установлены — локальные формулы уже проверены
     assert _Opt.C_W == C_W
@@ -119,9 +126,15 @@ def test_optimizer_class_consistency():
     assert _Opt.F_HE_MAX == F_HE_MAX
     assert abs(_Opt.ETA_MHD - ETA_MHD) < 1e-12
     assert abs(_Opt.ETA_STEAM - ETA_STEAM) < 1e-12
-    st = _Opt._station_balance(
-        CHAMPION["P_fusion_W"], CHAMPION["P_sync_W"],
-        B_T=CHAMPION["external_B"], pump_speed=CHAMPION["pump_speed"])
+    old_coolant = getattr(_Opt, "COOLANT", None)
+    _Opt.COOLANT = "steam"  # v37.2: чемпион записан в паровой эпохе
+    try:
+        st = _Opt._station_balance(
+            CHAMPION["P_fusion_W"], CHAMPION["P_sync_W"],
+            B_T=CHAMPION["external_B"], pump_speed=CHAMPION["pump_speed"])
+    finally:
+        if old_coolant is not None:
+            _Opt.COOLANT = old_coolant  # возвращаем режим как был — класс не трогаем
     assert abs(st["P_net_W"] - CHAMPION["P_net_W_expected"]) / \
         CHAMPION["P_net_W_expected"] < 1e-9
 
