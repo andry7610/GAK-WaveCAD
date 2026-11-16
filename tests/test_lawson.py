@@ -134,4 +134,3 @@ def test_lawson_uses_correct_threshold(fuel, threshold):
         assert p.check_lawson() is True
     else:
         assert p.check_lawson() is False
-
